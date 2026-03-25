@@ -3,18 +3,29 @@ import { Telegraf } from 'telegraf';
 import { supabase } from '@/lib/supabase/client';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
-const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
+const geminiApiKey = process.env.GEMINI_API_KEY;
 
-bot.on('text', async (ctx) => {
-  const text = ctx.message.text;
+if (!telegramBotToken) {
+  throw new Error('TELEGRAM_BOT_TOKEN is not defined in environment variables.');
+}
+if (!geminiApiKey) {
+  throw new Error('GEMINI_API_KEY is not defined in environment variables.');
+}
 
-  const model = genAI.getGenerativeModel({
-    model: 'gemini-2.5-flash',
-    generationConfig: { responseMimeType: 'application/json' },
-  });
+const bot = new Telegraf(telegramBotToken);
+const genAI = new GoogleGenerativeAI(geminiApiKey);
 
-  const prompt = `Voce e o Nexus Wealth, um assistente financeiro, contador virtual e agente conversacional inteligente.
+interface NexusResponse {
+  is_transaction: boolean;
+  description: string;
+  amount: number;
+  type: 'income' | 'expense' | 'none';
+  entity: 'CPF' | 'CNPJ';
+  message: string;
+}
+
+const getNexusPrompt = (text: string) => `Voce e o Nexus Wealth, um assistente financeiro, contador virtual e agente conversacional inteligente.
 Sua personalidade e profissional, clara, educada, acolhedora e objetiva. Nunca seja grosso, rude, sarcastico ou hostil.
 Voce deve sempre tentar responder ao que o usuario perguntar da forma mais util possivel.
 Se a pergunta nao for financeira, ainda assim responda com gentileza e tente ajudar.
@@ -35,17 +46,28 @@ VOCE E OBRIGADO A RETORNAR APENAS UM JSON VALIDO (sem markdown) com a estrutura 
   "message": "Sua resposta final ao usuario, sempre educada, util e sem grosseria"
 }`;
 
+bot.on('text', async (ctx) => {
+  const text = ctx.message.text;
+
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-2.5-flash',
+    generationConfig: { responseMimeType: 'application/json' },
+  });
+
+  const prompt = getNexusPrompt(text);
+
   try {
     const result = await model.generateContent(prompt);
-    let responseText = result.response.text();
+    const responseText = result.response.text();
 
-    responseText = responseText.replace(/```json/gi, '').replace(/```/g, '').trim();
+    const cleanedText = responseText.replace(/```json/gi, '').replace(/```/g, '').trim();
 
-    let data;
+    let data: NexusResponse;
     try {
-      data = JSON.parse(responseText);
-    } catch {
-      await ctx.reply(`Nexus: ${responseText}`);
+      data = JSON.parse(cleanedText);
+    } catch (parseError) {
+      console.error('JSON Parse Error:', parseError, 'Raw text:', cleanedText);
+      await ctx.reply('Desculpe, não consegui processar sua solicitação. Poderia tentar novamente?');
       return;
     }
 
@@ -55,22 +77,22 @@ VOCE E OBRIGADO A RETORNAR APENAS UM JSON VALIDO (sem markdown) com a estrutura 
           description: data.description,
           amount: data.amount,
           type: data.type,
-          entity: data.entity || 'CPF',
+          entity: data.entity || 'CPF', // Default to CPF
         },
       ]);
 
       if (error) {
-        console.error(error);
-        await ctx.reply('Erro ao salvar a transacao no banco.');
+        console.error('Supabase Error:', error);
+        await ctx.reply('Ocorreu um erro ao salvar sua transação. Por favor, tente novamente.');
       } else {
-        await ctx.reply(`Registro salvo com sucesso.\n\nNexus: ${data.message}`);
+        await ctx.reply(`Registro salvo com sucesso!\n\nNexus: ${data.message}`);
       }
     } else {
       await ctx.reply(`Nexus: ${data.message}`);
     }
   } catch (err) {
-    console.error('Erro na IA:', err);
-    await ctx.reply('Erro de conexao com a IA no momento.');
+    console.error('Gemini AI Error:', err);
+    await ctx.reply('Desculpe, estou com problemas para me conectar à inteligência artificial no momento. Tente novamente mais tarde.');
   }
 });
 
