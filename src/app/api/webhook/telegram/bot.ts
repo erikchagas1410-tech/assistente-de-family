@@ -137,13 +137,29 @@ const getGeminiUserMessage = (error: unknown) => {
       return 'A chave do Gemini configurada no deploy parece invalida. Verifique a GEMINI_API_KEY na Vercel.';
     }
 
-    if (message.includes('quota') || message.includes('429')) {
+    if (
+      message.includes('quota') ||
+      message.includes('rate limit') ||
+      message.includes('resource has been exhausted') ||
+      message.includes('429')
+    ) {
       return 'O Gemini atingiu limite de uso no momento. Tente novamente em alguns instantes.';
     }
 
     if (message.includes('fetch failed')) {
       return 'Nao consegui alcancar a API do Gemini a partir do servidor.';
     }
+
+    if (
+      message.includes('candidate') ||
+      message.includes('response') ||
+      message.includes('json') ||
+      message.includes('parse')
+    ) {
+      return 'O Gemini respondeu em um formato que nao consegui interpretar. Tente reformular a mensagem.';
+    }
+
+    return `Erro no Gemini: ${error.message}`;
   }
 
   return 'Estou com problemas para me conectar a inteligencia artificial no momento. Tente novamente mais tarde.';
@@ -237,7 +253,11 @@ const registerHandlers = (bot: Telegraf, model: TelegramRuntime['model']) => {
 
       await ctx.reply(`Nexus: ${data.message}`);
     } catch (err) {
-      console.error('Gemini API Error:', err);
+      console.error('Gemini API Error:', {
+        error: err,
+        text,
+        chatId,
+      });
       await ctx.reply(getGeminiUserMessage(err));
     }
   });
