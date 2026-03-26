@@ -1,4 +1,3 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Telegraf } from 'telegraf';
 import { Update } from 'telegraf/types';
 import { BANK_ACCOUNTS, BANK_ACCOUNT_BY_ID, isValidBankAccount } from '@/lib/banks';
@@ -25,7 +24,18 @@ interface PendingTransaction {
 
 interface TelegramRuntime {
   bot: Telegraf;
-  model: ReturnType<GoogleGenerativeAI['getGenerativeModel']>;
+  groqApiKey: string;
+}
+
+interface GroqChatResponse {
+  choices?: Array<{
+    message?: {
+      content?: string;
+    };
+  }>;
+  error?: {
+    message?: string;
+  };
 }
 
 const pendingTransactions = new Map<number, PendingTransaction>();
@@ -45,7 +55,7 @@ O usuario disse: "${text}".
 - Santander existe apenas como santander_pf.
 - Se houver transacao, mas o banco nao estiver claro, retorne "needs_bank": true e "bank_account": "none".
 - Se houver lancamento positivo, trate como "income" e preserve o banco correto para esse banco especifico.
-VOCE E OBRIGADO A RETORNAR APENAS UM JSON VALIDO (sem markdown) com a estrutura abaixo:
+VOCE E OBRIGADO A RETORNAR APENAS UM JSON VALIDO com a estrutura abaixo:
 {
   "is_transaction": boolean,
   "description": "string curta ou 'none'",
@@ -129,7 +139,42 @@ const saveTransaction = async (
   ]);
 };
 
-const registerHandlers = (bot: Telegraf, model: TelegramRuntime['model']) => {
+const getGroqResponse = async (prompt: string, groqApiKey: string): Promise<NexusResponse> => {
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${groqApiKey}`,
+    },
+    body: JSON.stringify({
+      model: 'llama-3.3-70b-versatile',
+      temperature: 0.2,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'user',
+          content: prompt,
+        },
+      ],
+    }),
+  });
+
+  const body = (await response.json()) as GroqChatResponse;
+
+  if (!response.ok) {
+    throw new Error(body.error?.message || `Groq request failed with status ${response.status}`);
+  }
+
+  const content = body.choices?.[0]?.message?.content?.trim();
+
+  if (!content) {
+    throw new Error('Groq returned an empty response.');
+  }
+
+  return JSON.parse(content) as NexusResponse;
+};
+
+const registerHandlers = (bot: Telegraf, groqApiKey: string) => {
   bot.on('text', async (ctx) => {
     const text = ctx.message.text.trim();
     const chatId = ctx.chat.id;
@@ -163,18 +208,7 @@ const registerHandlers = (bot: Telegraf, model: TelegramRuntime['model']) => {
     const prompt = getNexusPrompt(text);
 
     try {
-      const result = await model.generateContent(prompt);
-      const responseText = result.response.text();
-      const cleanedText = responseText.replace(/```json/gi, '').replace(/```/g, '').trim();
-
-      let data: NexusResponse;
-      try {
-        data = JSON.parse(cleanedText) as NexusResponse;
-      } catch (parseError) {
-        console.error('JSON Parse Error:', parseError, 'Raw text:', cleanedText);
-        await ctx.reply('Nao consegui processar sua solicitacao. Tente novamente.');
-        return;
-      }
+      const data = await getGroqResponse(prompt, groqApiKey);
 
       if (data.is_transaction && data.amount > 0 && data.type !== 'none') {
         const inferredBank =
@@ -217,7 +251,7 @@ const registerHandlers = (bot: Telegraf, model: TelegramRuntime['model']) => {
 
       await ctx.reply(`Nexus: ${data.message}`);
     } catch (err) {
-      console.error('Gemini AI Error:', err);
+      console.error('Groq API Error:', err);
       await ctx.reply(
         'Estou com problemas para me conectar a inteligencia artificial no momento. Tente novamente mais tarde.',
       );
@@ -229,25 +263,19 @@ const getTelegramRuntime = (): TelegramRuntime => {
   if (runtime) return runtime;
 
   const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
-  const geminiApiKey = process.env.GEMINI_API_KEY;
+  const groqApiKey = process.env.GROQ_API_KEY;
 
   if (!telegramBotToken) {
     throw new Error('TELEGRAM_BOT_TOKEN is not defined in environment variables.');
   }
 
-  if (!geminiApiKey) {
-    throw new Error('GEMINI_API_KEY is not defined in environment variables.');
+  if (!groqApiKey) {
+    throw new Error('GROQ_API_KEY is not defined in environment variables.');
   }
 
   const bot = new Telegraf(telegramBotToken);
-  const genAI = new GoogleGenerativeAI(geminiApiKey);
-  const model = genAI.getGenerativeModel({
-    model: 'gemini-1.5-flash',
-    generationConfig: { responseMimeType: 'application/json' },
-  });
-
-  registerHandlers(bot, model);
-  runtime = { bot, model };
+  registerHandlers(bot, groqApiKey);
+  runtime = { bot, groqApiKey };
   return runtime;
 };
 
