@@ -24,10 +24,10 @@ interface PendingTransaction {
 
 interface TelegramRuntime {
   bot: Telegraf;
-  groqApiKey: string;
+  openRouterApiKey: string;
 }
 
-interface GroqChatResponse {
+interface OpenRouterChatResponse {
   choices?: Array<{
     message?: {
       content?: string;
@@ -38,12 +38,12 @@ interface GroqChatResponse {
   };
 }
 
-class GroqRequestError extends Error {
+class OpenRouterRequestError extends Error {
   status?: number;
 
   constructor(message: string, status?: number) {
     super(message);
-    this.name = 'GroqRequestError';
+    this.name = 'OpenRouterRequestError';
     this.status = status;
   }
 }
@@ -149,45 +149,50 @@ const saveTransaction = async (
   ]);
 };
 
-const getGroqUserMessage = (error: unknown) => {
-  if (error instanceof GroqRequestError) {
+const getProviderUserMessage = (error: unknown) => {
+  if (error instanceof OpenRouterRequestError) {
     if (error.status === 401) {
-      return 'A chave da Groq configurada no deploy parece invalida. Verifique a GROQ_API_KEY na Vercel.';
+      return 'A chave da OpenRouter configurada no deploy parece invalida. Verifique a OPENROUTER_API_KEY na Vercel.';
     }
 
     if (error.status === 429) {
-      return 'A Groq atingiu limite de uso no momento. Tente novamente em alguns instantes.';
+      return 'O modelo gratuito da OpenRouter atingiu limite de uso no momento. Tente novamente mais tarde ou troque de modelo.';
     }
 
     if (error.status === 400) {
-      return 'A Groq rejeitou a requisicao enviada pelo bot. Revise a configuracao do modelo e da chave.';
+      return 'A OpenRouter rejeitou a requisicao enviada pelo bot. Revise a configuracao do modelo e da chave.';
     }
 
-    return `A Groq retornou erro ${error.status ?? 'desconhecido'}.`;
+    return `A OpenRouter retornou erro ${error.status ?? 'desconhecido'}.`;
   }
 
   if (error instanceof Error) {
     if (error.message.includes('fetch failed')) {
-      return 'Nao consegui alcancar a API da Groq a partir do servidor.';
+      return 'Nao consegui alcancar a API da OpenRouter a partir do servidor.';
     }
 
     if (error.message.includes('empty response')) {
-      return 'A Groq respondeu vazia e nao consegui interpretar a resposta.';
+      return 'A OpenRouter respondeu vazia e nao consegui interpretar a resposta.';
     }
   }
 
   return 'Estou com problemas para me conectar a inteligencia artificial no momento. Tente novamente mais tarde.';
 };
 
-const getGroqResponse = async (prompt: string, groqApiKey: string): Promise<NexusResponse> => {
-  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+const getOpenRouterResponse = async (
+  prompt: string,
+  openRouterApiKey: string,
+): Promise<NexusResponse> => {
+  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${groqApiKey}`,
+      Authorization: `Bearer ${openRouterApiKey}`,
+      'HTTP-Referer': 'https://assistente-de-family.vercel.app',
+      'X-Title': 'Assistente de Family',
     },
     body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
+      model: 'mistralai/mistral-7b-instruct:free',
       temperature: 0.2,
       response_format: { type: 'json_object' },
       messages: [
@@ -199,11 +204,11 @@ const getGroqResponse = async (prompt: string, groqApiKey: string): Promise<Nexu
     }),
   });
 
-  const body = (await response.json()) as GroqChatResponse;
+  const body = (await response.json()) as OpenRouterChatResponse;
 
   if (!response.ok) {
-    throw new GroqRequestError(
-      body.error?.message || `Groq request failed with status ${response.status}`,
+    throw new OpenRouterRequestError(
+      body.error?.message || `OpenRouter request failed with status ${response.status}`,
       response.status,
     );
   }
@@ -211,13 +216,13 @@ const getGroqResponse = async (prompt: string, groqApiKey: string): Promise<Nexu
   const content = body.choices?.[0]?.message?.content?.trim();
 
   if (!content) {
-    throw new Error('Groq returned an empty response.');
+    throw new Error('OpenRouter returned an empty response.');
   }
 
   return JSON.parse(content) as NexusResponse;
 };
 
-const registerHandlers = (bot: Telegraf, groqApiKey: string) => {
+const registerHandlers = (bot: Telegraf, openRouterApiKey: string) => {
   bot.on('text', async (ctx) => {
     const text = ctx.message.text.trim();
     const chatId = ctx.chat.id;
@@ -251,7 +256,7 @@ const registerHandlers = (bot: Telegraf, groqApiKey: string) => {
     const prompt = getNexusPrompt(text);
 
     try {
-      const data = await getGroqResponse(prompt, groqApiKey);
+      const data = await getOpenRouterResponse(prompt, openRouterApiKey);
 
       if (data.is_transaction && data.amount > 0 && data.type !== 'none') {
         const inferredBank =
@@ -294,8 +299,8 @@ const registerHandlers = (bot: Telegraf, groqApiKey: string) => {
 
       await ctx.reply(`Nexus: ${data.message}`);
     } catch (err) {
-      console.error('Groq API Error:', err);
-      await ctx.reply(getGroqUserMessage(err));
+      console.error('OpenRouter API Error:', err);
+      await ctx.reply(getProviderUserMessage(err));
     }
   });
 };
@@ -304,19 +309,19 @@ const getTelegramRuntime = (): TelegramRuntime => {
   if (runtime) return runtime;
 
   const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
-  const groqApiKey = process.env.GROQ_API_KEY;
+  const openRouterApiKey = process.env.OPENROUTER_API_KEY;
 
   if (!telegramBotToken) {
     throw new Error('TELEGRAM_BOT_TOKEN is not defined in environment variables.');
   }
 
-  if (!groqApiKey) {
-    throw new Error('GROQ_API_KEY is not defined in environment variables.');
+  if (!openRouterApiKey) {
+    throw new Error('OPENROUTER_API_KEY is not defined in environment variables.');
   }
 
   const bot = new Telegraf(telegramBotToken);
-  registerHandlers(bot, groqApiKey);
-  runtime = { bot, groqApiKey };
+  registerHandlers(bot, openRouterApiKey);
+  runtime = { bot, openRouterApiKey };
   return runtime;
 };
 
