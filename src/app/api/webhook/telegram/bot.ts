@@ -23,27 +23,15 @@ interface PendingTransaction {
   entity: EntityType;
 }
 
-const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
-const geminiApiKey = process.env.GEMINI_API_KEY;
-
-if (!telegramBotToken) {
-  throw new Error('TELEGRAM_BOT_TOKEN is not defined in environment variables.');
+interface TelegramRuntime {
+  bot: Telegraf;
+  model: ReturnType<GoogleGenerativeAI['getGenerativeModel']>;
 }
-
-if (!geminiApiKey) {
-  throw new Error('GEMINI_API_KEY is not defined in environment variables.');
-}
-
-const bot = new Telegraf(telegramBotToken);
-const genAI = new GoogleGenerativeAI(geminiApiKey);
-const model = genAI.getGenerativeModel({
-  model: 'gemini-1.5-flash',
-  generationConfig: { responseMimeType: 'application/json' },
-});
 
 const pendingTransactions = new Map<number, PendingTransaction>();
-
 const supportedBankList = BANK_ACCOUNTS.map((account) => `${account.id} (${account.label})`).join(', ');
+
+let runtime: TelegramRuntime | null = null;
 
 const getNexusPrompt = (text: string) => `Voce e o Nexus Wealth, um assistente financeiro, contador virtual e agente conversacional inteligente.
 Sua personalidade e profissional, clara, educada, acolhedora e objetiva.
@@ -82,12 +70,20 @@ const findBankFromText = (text: string, entity?: EntityType): BankAccountId | nu
     const matchedAlias = account.aliases.some((alias) => normalized.includes(alias));
     if (!matchedAlias) continue;
 
-    if (normalized.includes('pf') || normalized.includes('pessoa fisica') || normalized.includes('pessoal')) {
+    if (
+      normalized.includes('pf') ||
+      normalized.includes('pessoa fisica') ||
+      normalized.includes('pessoal')
+    ) {
       if (account.entity === 'CPF') return account.id;
       continue;
     }
 
-    if (normalized.includes('pj') || normalized.includes('pessoa juridica') || normalized.includes('empresa')) {
+    if (
+      normalized.includes('pj') ||
+      normalized.includes('pessoa juridica') ||
+      normalized.includes('empresa')
+    ) {
       if (account.entity === 'CNPJ') return account.id;
       continue;
     }
@@ -133,96 +129,129 @@ const saveTransaction = async (
   ]);
 };
 
-bot.on('text', async (ctx) => {
-  const text = ctx.message.text.trim();
-  const chatId = ctx.chat.id;
-  const pending = pendingTransactions.get(chatId);
+const registerHandlers = (bot: Telegraf, model: TelegramRuntime['model']) => {
+  bot.on('text', async (ctx) => {
+    const text = ctx.message.text.trim();
+    const chatId = ctx.chat.id;
+    const pending = pendingTransactions.get(chatId);
 
-  if (pending) {
-    const bankAccount = findBankFromText(text, pending.entity);
+    if (pending) {
+      const bankAccount = findBankFromText(text, pending.entity);
 
-    if (!bankAccount) {
-      await ctx.reply(`Nao consegui identificar o banco.\n\n${getBankQuestion()}`);
-      return;
-    }
-
-    const { error } = await saveTransaction({ ...pending, bank_account: bankAccount });
-
-    if (error) {
-      console.error('Supabase Error:', error);
-      await ctx.reply('Ocorreu um erro ao salvar sua transacao. Verifique se a coluna bank_account existe na tabela transactions.');
-      return;
-    }
-
-    pendingTransactions.delete(chatId);
-    await ctx.reply(
-      `Registro salvo com sucesso no banco ${BANK_ACCOUNT_BY_ID[bankAccount].label}.`,
-    );
-    return;
-  }
-
-  const prompt = getNexusPrompt(text);
-
-  try {
-    const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
-    const cleanedText = responseText.replace(/```json/gi, '').replace(/```/g, '').trim();
-
-    let data: NexusResponse;
-    try {
-      data = JSON.parse(cleanedText) as NexusResponse;
-    } catch (parseError) {
-      console.error('JSON Parse Error:', parseError, 'Raw text:', cleanedText);
-      await ctx.reply('Nao consegui processar sua solicitacao. Tente novamente.');
-      return;
-    }
-
-    if (data.is_transaction && data.amount > 0 && data.type !== 'none') {
-      const inferredBank =
-        (isValidBankAccount(data.bank_account) ? data.bank_account : null) ||
-        findBankFromText(text, data.entity);
-
-      if (!inferredBank || data.needs_bank) {
-        pendingTransactions.set(chatId, {
-          description: data.description,
-          amount: data.amount,
-          type: data.type,
-          entity: data.entity || 'CPF',
-        });
-
-        await ctx.reply(`${data.message}\n\n${getBankQuestion()}`);
+      if (!bankAccount) {
+        await ctx.reply(`Nao consegui identificar o banco.\n\n${getBankQuestion()}`);
         return;
       }
 
-      const { error } = await saveTransaction({
-        description: data.description,
-        amount: data.amount,
-        type: data.type,
-        entity: data.entity || 'CPF',
-        bank_account: inferredBank,
-      });
+      const { error } = await saveTransaction({ ...pending, bank_account: bankAccount });
 
       if (error) {
         console.error('Supabase Error:', error);
-        await ctx.reply('Ocorreu um erro ao salvar sua transacao. Verifique se a coluna bank_account existe na tabela transactions.');
+        await ctx.reply(
+          'Ocorreu um erro ao salvar sua transacao. Verifique se a coluna bank_account existe na tabela transactions.',
+        );
         return;
       }
 
+      pendingTransactions.delete(chatId);
       await ctx.reply(
-        `Registro salvo com sucesso em ${BANK_ACCOUNT_BY_ID[inferredBank].label}.\n\nNexus: ${data.message}`,
+        `Registro salvo com sucesso no banco ${BANK_ACCOUNT_BY_ID[bankAccount].label}.`,
       );
       return;
     }
 
-    await ctx.reply(`Nexus: ${data.message}`);
-  } catch (err) {
-    console.error('Gemini AI Error:', err);
-    await ctx.reply(
-      'Estou com problemas para me conectar a inteligencia artificial no momento. Tente novamente mais tarde.',
-    );
+    const prompt = getNexusPrompt(text);
+
+    try {
+      const result = await model.generateContent(prompt);
+      const responseText = result.response.text();
+      const cleanedText = responseText.replace(/```json/gi, '').replace(/```/g, '').trim();
+
+      let data: NexusResponse;
+      try {
+        data = JSON.parse(cleanedText) as NexusResponse;
+      } catch (parseError) {
+        console.error('JSON Parse Error:', parseError, 'Raw text:', cleanedText);
+        await ctx.reply('Nao consegui processar sua solicitacao. Tente novamente.');
+        return;
+      }
+
+      if (data.is_transaction && data.amount > 0 && data.type !== 'none') {
+        const inferredBank =
+          (isValidBankAccount(data.bank_account) ? data.bank_account : null) ||
+          findBankFromText(text, data.entity);
+
+        if (!inferredBank || data.needs_bank) {
+          pendingTransactions.set(chatId, {
+            description: data.description,
+            amount: data.amount,
+            type: data.type,
+            entity: data.entity || 'CPF',
+          });
+
+          await ctx.reply(`${data.message}\n\n${getBankQuestion()}`);
+          return;
+        }
+
+        const { error } = await saveTransaction({
+          description: data.description,
+          amount: data.amount,
+          type: data.type,
+          entity: data.entity || 'CPF',
+          bank_account: inferredBank,
+        });
+
+        if (error) {
+          console.error('Supabase Error:', error);
+          await ctx.reply(
+            'Ocorreu um erro ao salvar sua transacao. Verifique se a coluna bank_account existe na tabela transactions.',
+          );
+          return;
+        }
+
+        await ctx.reply(
+          `Registro salvo com sucesso em ${BANK_ACCOUNT_BY_ID[inferredBank].label}.\n\nNexus: ${data.message}`,
+        );
+        return;
+      }
+
+      await ctx.reply(`Nexus: ${data.message}`);
+    } catch (err) {
+      console.error('Gemini AI Error:', err);
+      await ctx.reply(
+        'Estou com problemas para me conectar a inteligencia artificial no momento. Tente novamente mais tarde.',
+      );
+    }
+  });
+};
+
+const getTelegramRuntime = (): TelegramRuntime => {
+  if (runtime) return runtime;
+
+  const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+
+  if (!telegramBotToken) {
+    throw new Error('TELEGRAM_BOT_TOKEN is not defined in environment variables.');
   }
-});
+
+  if (!geminiApiKey) {
+    throw new Error('GEMINI_API_KEY is not defined in environment variables.');
+  }
+
+  const bot = new Telegraf(telegramBotToken);
+  const genAI = new GoogleGenerativeAI(geminiApiKey);
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-1.5-flash',
+    generationConfig: { responseMimeType: 'application/json' },
+  });
+
+  registerHandlers(bot, model);
+  runtime = { bot, model };
+  return runtime;
+};
 
 export const telegramWebhookHandler = async (body: Update) => {
+  const { bot } = getTelegramRuntime();
   await bot.handleUpdate(body);
 };
