@@ -50,6 +50,13 @@ class OpenRouterRequestError extends Error {
 
 const pendingTransactions = new Map<number, PendingTransaction>();
 const supportedBankList = BANK_ACCOUNTS.map((account) => `${account.id} (${account.label})`).join(', ');
+const openRouterModels = [
+  'qwen/qwen3-4b:free',
+  'mistralai/mistral-small-3.1-24b-instruct:free',
+  'qwen/qwen3-coder:free',
+  'nvidia/nemotron-3-super-120b-a12b:free',
+  'minimax/minimax-m2.5:free',
+];
 
 let runtime: TelegramRuntime | null = null;
 
@@ -156,7 +163,7 @@ const getProviderUserMessage = (error: unknown) => {
     }
 
     if (error.status === 429) {
-      return 'O modelo gratuito da OpenRouter atingiu limite de uso no momento. Tente novamente mais tarde ou troque de modelo.';
+      return 'Os modelos gratuitos da OpenRouter estao com limite de uso no momento. Tente novamente em alguns instantes.';
     }
 
     if (error.status === 400) {
@@ -179,47 +186,88 @@ const getProviderUserMessage = (error: unknown) => {
   return 'Estou com problemas para me conectar a inteligencia artificial no momento. Tente novamente mais tarde.';
 };
 
+const extractJsonObject = (content: string) => {
+  const trimmed = content.trim();
+
+  try {
+    return JSON.parse(trimmed) as NexusResponse;
+  } catch {
+    const firstBrace = trimmed.indexOf('{');
+    const lastBrace = trimmed.lastIndexOf('}');
+
+    if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+      throw new Error('OpenRouter returned a non-JSON response.');
+    }
+
+    return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1)) as NexusResponse;
+  }
+};
+
 const getOpenRouterResponse = async (
   prompt: string,
   openRouterApiKey: string,
 ): Promise<NexusResponse> => {
-  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${openRouterApiKey}`,
-      'HTTP-Referer': 'https://assistente-de-family.vercel.app',
-      'X-Title': 'Assistente de Family',
-    },
-    body: JSON.stringify({
-      model: 'mistralai/mistral-7b-instruct:free',
-      temperature: 0.2,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'user',
-          content: prompt,
+  let lastError: Error | null = null;
+
+  for (const model of openRouterModels) {
+    for (const useJsonMode of [true, false]) {
+      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${openRouterApiKey}`,
+          'HTTP-Referer': 'https://assistente-de-family.vercel.app',
+          'X-Title': 'Assistente de Family',
         },
-      ],
-    }),
-  });
+        body: JSON.stringify({
+          model,
+          temperature: 0.2,
+          ...(useJsonMode ? { response_format: { type: 'json_object' } } : {}),
+          messages: [
+            {
+              role: 'user',
+              content: prompt,
+            },
+          ],
+        }),
+      });
 
-  const body = (await response.json()) as OpenRouterChatResponse;
+      const body = (await response.json()) as OpenRouterChatResponse;
 
-  if (!response.ok) {
-    throw new OpenRouterRequestError(
-      body.error?.message || `OpenRouter request failed with status ${response.status}`,
-      response.status,
-    );
+      if (!response.ok) {
+        const message =
+          body.error?.message || `OpenRouter request failed with status ${response.status}`;
+        const error = new OpenRouterRequestError(message, response.status);
+
+        if (
+          response.status === 400 &&
+          useJsonMode &&
+          /json mode|response_format|structured/i.test(message)
+        ) {
+          lastError = error;
+          continue;
+        }
+
+        if (response.status === 404 || response.status === 429) {
+          lastError = error;
+          break;
+        }
+
+        throw error;
+      }
+
+      const content = body.choices?.[0]?.message?.content?.trim();
+
+      if (!content) {
+        lastError = new Error(`OpenRouter returned an empty response for model ${model}.`);
+        break;
+      }
+
+      return extractJsonObject(content);
+    }
   }
 
-  const content = body.choices?.[0]?.message?.content?.trim();
-
-  if (!content) {
-    throw new Error('OpenRouter returned an empty response.');
-  }
-
-  return JSON.parse(content) as NexusResponse;
+  throw lastError || new Error('No OpenRouter models returned a valid response.');
 };
 
 const registerHandlers = (bot: Telegraf, openRouterApiKey: string) => {
