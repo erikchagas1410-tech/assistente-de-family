@@ -38,6 +38,16 @@ interface GroqChatResponse {
   };
 }
 
+class GroqRequestError extends Error {
+  status?: number;
+
+  constructor(message: string, status?: number) {
+    super(message);
+    this.name = 'GroqRequestError';
+    this.status = status;
+  }
+}
+
 const pendingTransactions = new Map<number, PendingTransaction>();
 const supportedBankList = BANK_ACCOUNTS.map((account) => `${account.id} (${account.label})`).join(', ');
 
@@ -139,6 +149,36 @@ const saveTransaction = async (
   ]);
 };
 
+const getGroqUserMessage = (error: unknown) => {
+  if (error instanceof GroqRequestError) {
+    if (error.status === 401) {
+      return 'A chave da Groq configurada no deploy parece invalida. Verifique a GROQ_API_KEY na Vercel.';
+    }
+
+    if (error.status === 429) {
+      return 'A Groq atingiu limite de uso no momento. Tente novamente em alguns instantes.';
+    }
+
+    if (error.status === 400) {
+      return 'A Groq rejeitou a requisicao enviada pelo bot. Revise a configuracao do modelo e da chave.';
+    }
+
+    return `A Groq retornou erro ${error.status ?? 'desconhecido'}.`;
+  }
+
+  if (error instanceof Error) {
+    if (error.message.includes('fetch failed')) {
+      return 'Nao consegui alcancar a API da Groq a partir do servidor.';
+    }
+
+    if (error.message.includes('empty response')) {
+      return 'A Groq respondeu vazia e nao consegui interpretar a resposta.';
+    }
+  }
+
+  return 'Estou com problemas para me conectar a inteligencia artificial no momento. Tente novamente mais tarde.';
+};
+
 const getGroqResponse = async (prompt: string, groqApiKey: string): Promise<NexusResponse> => {
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
@@ -162,7 +202,10 @@ const getGroqResponse = async (prompt: string, groqApiKey: string): Promise<Nexu
   const body = (await response.json()) as GroqChatResponse;
 
   if (!response.ok) {
-    throw new Error(body.error?.message || `Groq request failed with status ${response.status}`);
+    throw new GroqRequestError(
+      body.error?.message || `Groq request failed with status ${response.status}`,
+      response.status,
+    );
   }
 
   const content = body.choices?.[0]?.message?.content?.trim();
@@ -252,9 +295,7 @@ const registerHandlers = (bot: Telegraf, groqApiKey: string) => {
       await ctx.reply(`Nexus: ${data.message}`);
     } catch (err) {
       console.error('Groq API Error:', err);
-      await ctx.reply(
-        'Estou com problemas para me conectar a inteligencia artificial no momento. Tente novamente mais tarde.',
-      );
+      await ctx.reply(getGroqUserMessage(err));
     }
   });
 };
