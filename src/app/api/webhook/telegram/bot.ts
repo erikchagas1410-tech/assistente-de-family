@@ -1,3 +1,4 @@
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Telegraf } from 'telegraf';
 import { Update } from 'telegraf/types';
 import { BANK_ACCOUNTS, BANK_ACCOUNT_BY_ID, isValidBankAccount } from '@/lib/banks';
@@ -24,39 +25,11 @@ interface PendingTransaction {
 
 interface TelegramRuntime {
   bot: Telegraf;
-  openRouterApiKey: string;
-}
-
-interface OpenRouterChatResponse {
-  choices?: Array<{
-    message?: {
-      content?: string;
-    };
-  }>;
-  error?: {
-    message?: string;
-  };
-}
-
-class OpenRouterRequestError extends Error {
-  status?: number;
-
-  constructor(message: string, status?: number) {
-    super(message);
-    this.name = 'OpenRouterRequestError';
-    this.status = status;
-  }
+  model: ReturnType<GoogleGenerativeAI['getGenerativeModel']>;
 }
 
 const pendingTransactions = new Map<number, PendingTransaction>();
 const supportedBankList = BANK_ACCOUNTS.map((account) => `${account.id} (${account.label})`).join(', ');
-const openRouterModels = [
-  'qwen/qwen3-4b:free',
-  'mistralai/mistral-small-3.1-24b-instruct:free',
-  'qwen/qwen3-coder:free',
-  'nvidia/nemotron-3-super-120b-a12b:free',
-  'minimax/minimax-m2.5:free',
-];
 
 let runtime: TelegramRuntime | null = null;
 
@@ -72,7 +45,7 @@ O usuario disse: "${text}".
 - Santander existe apenas como santander_pf.
 - Se houver transacao, mas o banco nao estiver claro, retorne "needs_bank": true e "bank_account": "none".
 - Se houver lancamento positivo, trate como "income" e preserve o banco correto para esse banco especifico.
-VOCE E OBRIGADO A RETORNAR APENAS UM JSON VALIDO com a estrutura abaixo:
+VOCE E OBRIGADO A RETORNAR APENAS UM JSON VALIDO (sem markdown) com a estrutura abaixo:
 {
   "is_transaction": boolean,
   "description": "string curta ou 'none'",
@@ -156,121 +129,27 @@ const saveTransaction = async (
   ]);
 };
 
-const getProviderUserMessage = (error: unknown) => {
-  if (error instanceof OpenRouterRequestError) {
-    if (error.status === 401) {
-      return 'A chave da OpenRouter configurada no deploy parece invalida. Verifique a OPENROUTER_API_KEY na Vercel.';
-    }
-
-    if (error.status === 429) {
-      return 'Os modelos gratuitos da OpenRouter estao com limite de uso no momento. Tente novamente em alguns instantes.';
-    }
-
-    if (error.status === 400) {
-      return 'A OpenRouter rejeitou a requisicao enviada pelo bot. Revise a configuracao do modelo e da chave.';
-    }
-
-    return `A OpenRouter retornou erro ${error.status ?? 'desconhecido'}.`;
-  }
-
+const getGeminiUserMessage = (error: unknown) => {
   if (error instanceof Error) {
-    if (error.message.includes('fetch failed')) {
-      return 'Nao consegui alcancar a API da OpenRouter a partir do servidor.';
+    const message = error.message.toLowerCase();
+
+    if (message.includes('api key')) {
+      return 'A chave do Gemini configurada no deploy parece invalida. Verifique a GEMINI_API_KEY na Vercel.';
     }
 
-    if (error.message.includes('empty response')) {
-      return 'A OpenRouter respondeu vazia e nao consegui interpretar a resposta.';
+    if (message.includes('quota') || message.includes('429')) {
+      return 'O Gemini atingiu limite de uso no momento. Tente novamente em alguns instantes.';
+    }
+
+    if (message.includes('fetch failed')) {
+      return 'Nao consegui alcancar a API do Gemini a partir do servidor.';
     }
   }
 
   return 'Estou com problemas para me conectar a inteligencia artificial no momento. Tente novamente mais tarde.';
 };
 
-const extractJsonObject = (content: string) => {
-  const trimmed = content.trim();
-
-  try {
-    return JSON.parse(trimmed) as NexusResponse;
-  } catch {
-    const firstBrace = trimmed.indexOf('{');
-    const lastBrace = trimmed.lastIndexOf('}');
-
-    if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
-      throw new Error('OpenRouter returned a non-JSON response.');
-    }
-
-    return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1)) as NexusResponse;
-  }
-};
-
-const getOpenRouterResponse = async (
-  prompt: string,
-  openRouterApiKey: string,
-): Promise<NexusResponse> => {
-  let lastError: Error | null = null;
-
-  for (const model of openRouterModels) {
-    for (const useJsonMode of [true, false]) {
-      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${openRouterApiKey}`,
-          'HTTP-Referer': 'https://assistente-de-family.vercel.app',
-          'X-Title': 'Assistente de Family',
-        },
-        body: JSON.stringify({
-          model,
-          temperature: 0.2,
-          ...(useJsonMode ? { response_format: { type: 'json_object' } } : {}),
-          messages: [
-            {
-              role: 'user',
-              content: prompt,
-            },
-          ],
-        }),
-      });
-
-      const body = (await response.json()) as OpenRouterChatResponse;
-
-      if (!response.ok) {
-        const message =
-          body.error?.message || `OpenRouter request failed with status ${response.status}`;
-        const error = new OpenRouterRequestError(message, response.status);
-
-        if (
-          response.status === 400 &&
-          useJsonMode &&
-          /json mode|response_format|structured/i.test(message)
-        ) {
-          lastError = error;
-          continue;
-        }
-
-        if (response.status === 404 || response.status === 429) {
-          lastError = error;
-          break;
-        }
-
-        throw error;
-      }
-
-      const content = body.choices?.[0]?.message?.content?.trim();
-
-      if (!content) {
-        lastError = new Error(`OpenRouter returned an empty response for model ${model}.`);
-        break;
-      }
-
-      return extractJsonObject(content);
-    }
-  }
-
-  throw lastError || new Error('No OpenRouter models returned a valid response.');
-};
-
-const registerHandlers = (bot: Telegraf, openRouterApiKey: string) => {
+const registerHandlers = (bot: Telegraf, model: TelegramRuntime['model']) => {
   bot.on('text', async (ctx) => {
     const text = ctx.message.text.trim();
     const chatId = ctx.chat.id;
@@ -304,7 +183,18 @@ const registerHandlers = (bot: Telegraf, openRouterApiKey: string) => {
     const prompt = getNexusPrompt(text);
 
     try {
-      const data = await getOpenRouterResponse(prompt, openRouterApiKey);
+      const result = await model.generateContent(prompt);
+      const responseText = result.response.text();
+      const cleanedText = responseText.replace(/```json/gi, '').replace(/```/g, '').trim();
+
+      let data: NexusResponse;
+      try {
+        data = JSON.parse(cleanedText) as NexusResponse;
+      } catch (parseError) {
+        console.error('JSON Parse Error:', parseError, 'Raw text:', cleanedText);
+        await ctx.reply('Nao consegui processar sua solicitacao. Tente novamente.');
+        return;
+      }
 
       if (data.is_transaction && data.amount > 0 && data.type !== 'none') {
         const inferredBank =
@@ -347,8 +237,8 @@ const registerHandlers = (bot: Telegraf, openRouterApiKey: string) => {
 
       await ctx.reply(`Nexus: ${data.message}`);
     } catch (err) {
-      console.error('OpenRouter API Error:', err);
-      await ctx.reply(getProviderUserMessage(err));
+      console.error('Gemini API Error:', err);
+      await ctx.reply(getGeminiUserMessage(err));
     }
   });
 };
@@ -357,19 +247,25 @@ const getTelegramRuntime = (): TelegramRuntime => {
   if (runtime) return runtime;
 
   const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
-  const openRouterApiKey = process.env.OPENROUTER_API_KEY;
+  const geminiApiKey = process.env.GEMINI_API_KEY;
 
   if (!telegramBotToken) {
     throw new Error('TELEGRAM_BOT_TOKEN is not defined in environment variables.');
   }
 
-  if (!openRouterApiKey) {
-    throw new Error('OPENROUTER_API_KEY is not defined in environment variables.');
+  if (!geminiApiKey) {
+    throw new Error('GEMINI_API_KEY is not defined in environment variables.');
   }
 
   const bot = new Telegraf(telegramBotToken);
-  registerHandlers(bot, openRouterApiKey);
-  runtime = { bot, openRouterApiKey };
+  const genAI = new GoogleGenerativeAI(geminiApiKey);
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-1.5-flash',
+    generationConfig: { responseMimeType: 'application/json' },
+  });
+
+  registerHandlers(bot, model);
+  runtime = { bot, model };
   return runtime;
 };
 
