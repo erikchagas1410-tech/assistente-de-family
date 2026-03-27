@@ -51,6 +51,7 @@ interface PendingTransaction {
 }
 
 interface TransactionRow {
+  id?: string;
   description: string;
   amount: number;
   type: string;
@@ -242,6 +243,15 @@ const normalizeResponse = (raw: NexusResponse, originalText: string): NexusRespo
     acao = 'criar_lancamento';
   }
 
+  const normalizedOriginal = normalizeText(originalText);
+  if (acao === 'conversa') {
+    if (/(remover|apagar|excluir)/.test(normalizedOriginal)) {
+      acao = 'remover_lancamento';
+    } else if (/(editar|corrigir|alterar)/.test(normalizedOriginal)) {
+      acao = 'editar_lancamento';
+    }
+  }
+
   // Normaliza tipo
   let tipo: TransactionType | 'none' = 'none';
   const rawTipo = (raw.tipo as string)?.toLowerCase() ?? '';
@@ -401,6 +411,28 @@ const saveBill = async (bill: { descricao: string; valor: number; due_date: stri
     entity: bill.entity,
   }]);
 
+const findTransactionsForMutation = async (data: NexusResponse, originalText?: string) => {
+  let query = supabase
+    .from('transactions')
+    .select('id, description, amount, type, created_at, bank_account, entity');
+
+  const rawTerm = (originalText && originalText.trim()) || (data.descricao && data.descricao !== 'none' ? data.descricao : data.termo) || '';
+  const term = rawTerm
+    .trim()
+    .replace(/^(remover|apagar|excluir|editar|corrigir|alterar)\s+/i, '')
+    .replace(/\s+para\s+.*$/i, '')
+    .trim();
+  if (term && term !== 'none') {
+    query = query.ilike('description', '%' + term + '%');
+  }
+
+  if (data.tipo && data.tipo !== 'none') {
+    query = query.eq('type', data.tipo);
+  }
+
+  return query.order('created_at', { ascending: false }).limit(5);
+};
+
 // ─── Action Handlers ──────────────────────────────────────────────────────────
 
 const handleCriarContaPagar = async (ctx: BotCtx, data: NexusResponse) => {
@@ -528,6 +560,68 @@ const handleCriarLancamento = async (ctx: BotCtx, data: NexusResponse, originalT
   }
 
   await ctx.reply(`Nexus: ${data.message}`);
+};
+
+const handleRemoverLancamento = async (ctx: BotCtx, data: NexusResponse, originalText: string) => {
+  const { data: matches, error } = await findTransactionsForMutation(data, originalText);
+  if (error) {
+    await ctx.reply('Erro ao buscar o lancamento para remocao.');
+    return;
+  }
+
+  const tx = (matches as TransactionRow[] | null)?.[0];
+  if (!tx?.id) {
+    await ctx.reply('Nao encontrei um lancamento para remover. Tente citar a descricao, por exemplo: "remover uber".');
+    return;
+  }
+
+  const { error: deleteError } = await supabase.from('transactions').delete().eq('id', tx.id);
+  if (deleteError) {
+    await ctx.reply('Nao consegui remover esse lancamento. Tente novamente.');
+    return;
+  }
+
+  await ctx.reply('Removi o lancamento mais recente: ' + tx.description + ' (' + fmtBRL(Number(tx.amount)) + ').');
+};
+
+const handleEditarLancamento = async (ctx: BotCtx, data: NexusResponse, originalText: string) => {
+  const { data: matches, error } = await findTransactionsForMutation(data, originalText);
+  if (error) {
+    await ctx.reply('Erro ao buscar o lancamento para edicao.');
+    return;
+  }
+
+  const tx = (matches as TransactionRow[] | null)?.[0];
+  if (!tx?.id) {
+    await ctx.reply('Nao encontrei um lancamento para editar. Tente citar a descricao, por exemplo: "editar uber para 35".');
+    return;
+  }
+
+  const updates: { amount?: number; type?: TransactionType; description?: string; bank_account?: BankAccountId | null; entity?: EntityType } = {};
+  if (data.valor > 0) updates.amount = data.valor;
+  if (data.tipo !== 'none') updates.type = data.tipo;
+  if (data.descricao && data.descricao !== 'none') updates.description = data.descricao;
+
+  const inferredBank =
+    (isValidBankAccount(data.conta) ? data.conta : null) ||
+    findBankFromText(originalText, data.contexto);
+  if (inferredBank) {
+    updates.bank_account = inferredBank;
+    updates.entity = BANK_ACCOUNT_BY_ID[inferredBank].entity;
+  }
+
+  if (!Object.keys(updates).length) {
+    await ctx.reply('Entendi que voce quer editar, mas faltou dizer o que mudar. Ex.: "editar uber para 35".');
+    return;
+  }
+
+  const { error: updateError } = await supabase.from('transactions').update(updates).eq('id', tx.id);
+  if (updateError) {
+    await ctx.reply('Nao consegui editar esse lancamento. Tente novamente.');
+    return;
+  }
+
+  await ctx.reply('Atualizei o lancamento mais recente: ' + tx.description + '.');
 };
 
 const handleAnalise = async (ctx: BotCtx, userMessage: string, acao: AcaoType, periodo: string | undefined, groq: Groq) => {
@@ -714,8 +808,10 @@ export const handleTelegramUpdate = async (body: Update) => {
         await handleListagem(ctx as never, text, data.acao, data.periodo, data.termo, groq);
         break;
       case 'editar_lancamento':
+        await handleEditarLancamento(ctx as never, data, text);
+        break;
       case 'remover_lancamento':
-        await ctx.reply('Edição e remoção devem ser feitas no dashboard. Posso ajudar com outra coisa?');
+        await handleRemoverLancamento(ctx as never, data, text);
         break;
       case 'criar_conta_pagar':
         await handleCriarContaPagar(ctx as never, data);
