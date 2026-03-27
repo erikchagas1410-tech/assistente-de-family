@@ -254,39 +254,33 @@ const getBankQuestion = () =>
   ].join('\n');
 
 const getGeminiUserMessage = (error: unknown) => {
-  if (error instanceof Error) {
-    const message = error.message.toLowerCase();
+  const raw = error instanceof Error ? error.message : String(error);
+  const message = raw.toLowerCase();
 
-    if (message.includes('api key')) {
-      return 'A chave do Gemini configurada no deploy parece inválida. Verifique a GEMINI_API_KEY na Vercel.';
-    }
+  console.error('[Nexus] Gemini raw error:', raw);
 
-    if (
-      message.includes('quota') ||
-      message.includes('rate limit') ||
-      message.includes('resource has been exhausted') ||
-      message.includes('429')
-    ) {
-      return 'O Gemini atingiu limite de uso no momento. Tente novamente em alguns instantes.';
-    }
-
-    if (message.includes('fetch failed')) {
-      return 'Não consegui alcançar a API do Gemini a partir do servidor.';
-    }
-
-    if (
-      message.includes('candidate') ||
-      message.includes('response') ||
-      message.includes('json') ||
-      message.includes('parse')
-    ) {
-      return 'O Gemini respondeu em um formato que não consegui interpretar. Tente reformular a mensagem.';
-    }
-
-    return `Erro no Gemini: ${error.message}`;
+  if (message.includes('api key') || message.includes('api_key')) {
+    return 'Chave do Gemini inválida ou ausente. Verifique GEMINI_API_KEY nas variáveis de ambiente do deploy.';
   }
 
-  return 'Estou com problemas para me conectar à inteligência artificial no momento. Tente novamente mais tarde.';
+  if (
+    message.includes('quota') ||
+    message.includes('rate limit') ||
+    message.includes('resource has been exhausted') ||
+    message.includes('429')
+  ) {
+    return `Cota do Gemini esgotada. Aguarde e tente novamente.\n\n_Detalhe: ${raw.slice(0, 120)}_`;
+  }
+
+  if (message.includes('not found') || message.includes('404')) {
+    return `Modelo de IA não encontrado. Verifique o nome do modelo na configuração.\n\n_Detalhe: ${raw.slice(0, 120)}_`;
+  }
+
+  if (message.includes('fetch failed') || message.includes('econnrefused') || message.includes('etimedout')) {
+    return 'Não consegui alcançar a API do Gemini. Verifique a conexão do servidor.';
+  }
+
+  return `Erro Gemini: ${raw.slice(0, 200)}`;
 };
 
 // ─── Supabase ─────────────────────────────────────────────────────────────────
