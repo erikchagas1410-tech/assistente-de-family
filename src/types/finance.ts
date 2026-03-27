@@ -24,3 +24,15 @@ export interface Transaction {
   bank_account?: BankAccountId | null;
   category_id: string | null;
 }
+
+export interface Bill {
+  id: string;
+  created_at: Date;
+  description: string;
+  amount: number;
+  due_date: string; // ISO date YYYY-MM-DD
+  paid_at: Date | null;
+  entity: EntityType;
+  bank_account?: BankAccountId | null;
+  notes?: string | null;
+}

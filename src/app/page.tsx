@@ -1,10 +1,10 @@
-import { AlertTriangle, Landmark, TrendingDown, TrendingUp, Wallet, BarChart2, CalendarDays } from 'lucide-react';
+import { AlertTriangle, Landmark, TrendingDown, TrendingUp, Wallet, BarChart2, CalendarDays, Receipt } from 'lucide-react';
 import CategoryChart from '@/components/charts/CategoryChart';
 import TelemetryChart from '@/components/charts/TelemetryChart';
 import AiPanel, { FinancialContext } from '@/components/AiPanel';
 import { BANK_ACCOUNTS, getBankAccountLabel } from '@/lib/banks';
 import { supabase } from '@/lib/supabase/client';
-import { BankAccountId, Transaction } from '@/types/finance';
+import { BankAccountId, Bill, Transaction } from '@/types/finance';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -15,14 +15,15 @@ const fmt = (value: number) =>
 // ─── Data ─────────────────────────────────────────────────────────────────────
 
 export default async function Home() {
-  const { data, error } = await supabase
-    .from('transactions')
-    .select('*')
-    .order('created_at', { ascending: false });
+  const [{ data, error }, { data: billsData }] = await Promise.all([
+    supabase.from('transactions').select('*').order('created_at', { ascending: false }),
+    supabase.from('bills').select('*').order('due_date', { ascending: true }),
+  ]);
 
   if (error) console.error('Supabase error:', error);
 
   const transactions = (data ?? []) as Transaction[];
+  const bills = (billsData ?? []) as Bill[];
 
   // ── Totals by entity ──────────────────────────────────────────────────────
   let incomeCpf = 0, expenseCpf = 0, incomeCnpj = 0, expenseCnpj = 0;
@@ -117,6 +118,33 @@ export default async function Home() {
 
   const unassigned = transactions.filter((t) => !t.bank_account).length;
 
+  // ── Bills status ──────────────────────────────────────────────────────────
+  const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const in3Days = new Date(todayMidnight.getTime() + 3 * 86400000);
+
+  const billsWithStatus = bills.map((bill) => {
+    const due = new Date(bill.due_date + 'T00:00:00');
+    let status: 'overdue' | 'due_soon' | 'pending' | 'paid';
+    if (bill.paid_at) status = 'paid';
+    else if (due < todayMidnight) status = 'overdue';
+    else if (due <= in3Days) status = 'due_soon';
+    else status = 'pending';
+    const diffDays = Math.round((due.getTime() - todayMidnight.getTime()) / 86400000);
+    return { ...bill, status, diffDays };
+  });
+
+  // Sort: overdue → due_soon → pending → paid
+  const statusOrder = { overdue: 0, due_soon: 1, pending: 2, paid: 3 } as const;
+  billsWithStatus.sort((a, b) => {
+    const diff = statusOrder[a.status] - statusOrder[b.status];
+    if (diff !== 0) return diff;
+    return new Date(a.due_date).getTime() - new Date(b.due_date).getTime();
+  });
+
+  const overdueBills = billsWithStatus.filter((b) => b.status === 'overdue');
+  const dueSoonBills = billsWithStatus.filter((b) => b.status === 'due_soon');
+  const unpaidBills  = billsWithStatus.filter((b) => b.status !== 'paid');
+
   // ── AI Insights ───────────────────────────────────────────────────────────
   const insights: string[] = [];
 
@@ -135,6 +163,12 @@ export default async function Home() {
   if (projectedBalance < 0) {
     insights.push(`Projeção indica déficit de ${fmt(Math.abs(projectedBalance))} ao fechar o mês.`);
   }
+  if (overdueBills.length > 0) {
+    insights.push(`${overdueBills.length} conta(s) vencida(s) — total de ${fmt(overdueBills.reduce((s, b) => s + Number(b.amount), 0))}.`);
+  }
+  if (dueSoonBills.length > 0) {
+    insights.push(`${dueSoonBills.length} conta(s) vencem em até 3 dias — total de ${fmt(dueSoonBills.reduce((s, b) => s + Number(b.amount), 0))}.`);
+  }
 
   // ── AI Alert ─────────────────────────────────────────────────────────────
   let aiAlert: string | null = null;
@@ -144,6 +178,10 @@ export default async function Home() {
     aiAlert = `Projeção indica déficit de ${fmt(Math.abs(projectedBalance))} no ritmo atual de gastos.`;
   } else if (expenseRatio > 0.7 && expensesByCategory[0]) {
     aiAlert = `"${expensesByCategory[0].name}" representa ${Math.round((expensesByCategory[0].value / totalExpense) * 100)}% das suas despesas. Vale revisar.`;
+  } else if (overdueBills.length > 0) {
+    aiAlert = `${overdueBills.length} conta(s) vencida(s) sem pagamento — total de ${fmt(overdueBills.reduce((s, b) => s + Number(b.amount), 0))}. Regularize para evitar juros.`;
+  } else if (dueSoonBills.length > 0) {
+    aiAlert = `${dueSoonBills.length} conta(s) vencem nos próximos 3 dias: ${dueSoonBills.map((b) => b.description).join(', ')}.`;
   }
 
   // ── Financial context for AI panel ───────────────────────────────────────
@@ -496,6 +534,99 @@ export default async function Home() {
                     </div>
                   </div>
                 ))
+              )}
+            </div>
+          </div>
+        </section>
+        {/* ── Bills ─────────────────────────────────────────────────── */}
+        <section>
+          <div className="bg-white/[0.02] border border-white/[0.05] rounded-xl overflow-hidden">
+            <div className="flex items-center gap-2.5 px-5 py-4 border-b border-white/[0.04]">
+              <Receipt className="w-4 h-4 text-white/25" />
+              <p className="text-[11px] font-bold uppercase tracking-[0.25em] text-white/30">
+                Contas a Pagar
+              </p>
+              <div className="ml-auto flex items-center gap-2">
+                {overdueBills.length > 0 && (
+                  <span className="text-[10px] font-bold text-rose-400 border border-rose-500/30 rounded-full px-2 py-0.5">
+                    {overdueBills.length} vencida{overdueBills.length > 1 ? 's' : ''}
+                  </span>
+                )}
+                {dueSoonBills.length > 0 && (
+                  <span className="text-[10px] font-bold text-amber-400 border border-amber-500/30 rounded-full px-2 py-0.5">
+                    {dueSoonBills.length} urgente{dueSoonBills.length > 1 ? 's' : ''}
+                  </span>
+                )}
+                <span className="text-[10px] text-white/20">{unpaidBills.length} pendentes</span>
+              </div>
+            </div>
+
+            <div className="divide-y divide-white/[0.03]">
+              {billsWithStatus.length === 0 ? (
+                <p className="px-5 py-8 text-sm text-white/20 text-center">
+                  Nenhuma conta cadastrada.
+                </p>
+              ) : (
+                billsWithStatus.map((bill) => {
+                  const isOverdue  = bill.status === 'overdue';
+                  const isDueSoon  = bill.status === 'due_soon';
+                  const isPaid     = bill.status === 'paid';
+
+                  const rowBg = isOverdue
+                    ? 'bg-rose-500/[0.04]'
+                    : isDueSoon
+                    ? 'bg-amber-500/[0.04]'
+                    : isPaid
+                    ? 'bg-emerald-500/[0.025]'
+                    : '';
+
+                  const dotColor = isOverdue
+                    ? 'bg-rose-400'
+                    : isDueSoon
+                    ? 'bg-amber-400'
+                    : isPaid
+                    ? 'bg-emerald-400'
+                    : 'bg-white/20';
+
+                  const amountColor = isOverdue
+                    ? 'text-rose-400'
+                    : isDueSoon
+                    ? 'text-amber-400'
+                    : isPaid
+                    ? 'text-emerald-400'
+                    : 'text-white/50';
+
+                  const dueLabel = isPaid
+                    ? `paga em ${new Date(String(bill.paid_at)).toLocaleDateString('pt-BR')}`
+                    : bill.diffDays < 0
+                    ? `venceu há ${Math.abs(bill.diffDays)} dia${Math.abs(bill.diffDays) > 1 ? 's' : ''}`
+                    : bill.diffDays === 0
+                    ? 'vence hoje'
+                    : `vence em ${bill.diffDays} dia${bill.diffDays > 1 ? 's' : ''}`;
+
+                  return (
+                    <div
+                      key={bill.id}
+                      className={`flex items-center gap-4 px-5 py-3 hover:bg-white/[0.015] transition-colors ${rowBg}`}
+                    >
+                      <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${dotColor}`} />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm text-white/70 truncate">{bill.description}</p>
+                        <p className="text-[10px] text-white/25 mt-0.5">
+                          {bill.entity}
+                          {bill.bank_account ? ` · ${bill.bank_account}` : ''}
+                          {bill.notes ? ` · ${bill.notes}` : ''}
+                        </p>
+                      </div>
+                      <div className="text-right flex-shrink-0">
+                        <p className={`text-sm font-semibold tabular-nums ${amountColor}`}>
+                          -{fmt(Number(bill.amount))}
+                        </p>
+                        <p className="text-[10px] text-white/20 mt-0.5">{dueLabel}</p>
+                      </div>
+                    </div>
+                  );
+                })
               )}
             </div>
           </div>

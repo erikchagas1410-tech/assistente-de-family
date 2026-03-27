@@ -21,6 +21,9 @@ type AcaoType =
   | 'comparar_periodos'
   | 'sugerir_ajustes'
   | 'sugerir_investimentos'
+  | 'criar_conta_pagar'
+  | 'listar_contas_pagar'
+  | 'marcar_conta_paga'
   | 'conversa';
 
 interface NexusResponse {
@@ -29,6 +32,7 @@ interface NexusResponse {
   valor: number;
   descricao: string;
   data: string;
+  vencimento: string; // YYYY-MM-DD ou "none" (para criar_conta_pagar)
   categoria: string;
   conta: BankAccountId | 'none';
   contexto: EntityType;
@@ -77,9 +81,16 @@ interface TelegramRuntime {
   groq: Groq;
 }
 
+interface PendingBillCreation {
+  descricao: string;
+  valor: number;
+  entity: EntityType;
+}
+
 // ─── State ────────────────────────────────────────────────────────────────────
 
-const pendingTransactions = new Map<number, PendingTransaction>();
+const pendingTransactions  = new Map<number, PendingTransaction>();
+const pendingBillCreations = new Map<number, PendingBillCreation>();
 
 interface HistoryMessage { role: 'user' | 'assistant'; content: string }
 const conversationHistory = new Map<number, HistoryMessage[]>();
@@ -115,15 +126,17 @@ const generateText = async (groq: Groq, prompt: string): Promise<string> => {
 
 // ─── Prompts ──────────────────────────────────────────────────────────────────
 
-const getClassifierPrompt = (text: string) => `
-Classifique a intenção do usuário e retorne JSON. Nada mais.
+const getClassifierPrompt = (text: string) => {
+  const today = new Date().toISOString().split('T')[0];
+  return `Classifique a intenção do usuário e retorne JSON. Nada mais.
 
 Mensagem: "${text}"
+Hoje: ${today}
 
 AÇÕES:
 - transação (gastei, paguei, recebi, lançar, registrar, entrou, saiu) → criar_lancamento
-- remover/apagar/excluir → remover_lancamento
-- editar/corrigir/alterar → editar_lancamento
+- remover/apagar/excluir lançamento → remover_lancamento
+- editar/corrigir/alterar lançamento → editar_lancamento
 - listar/mostrar lançamentos → listar_lancamentos
 - buscar lançamento → buscar_lancamento
 - resumo do mês/período → resumo_periodo
@@ -133,12 +146,16 @@ AÇÕES:
 - comparar períodos → comparar_periodos
 - onde economizar/ajustes → sugerir_ajustes
 - investir/investimento → sugerir_investimentos
+- adicionar conta/boleto/fatura a pagar (nova conta, lembrar de pagar, vence dia X) → criar_conta_pagar
+- listar/mostrar/quais contas a pagar/vencem → listar_contas_pagar
+- marcar conta como paga/quitada (paguei a conta de X) → marcar_conta_paga
 - tudo mais → conversa
 
 BANCOS VÁLIDOS: ${supportedBankList}
 CPF por padrão. CNPJ só se mencionar empresa/PJ/CNPJ.
 Banco não identificado → needs_bank: true, conta: "none".
 Receita/entrada → tipo: "income". Gasto/saída → tipo: "expense".
+Para datas de vencimento: interprete "dia 5", "dia 10/04", "próximo dia 15" usando a data de hoje e retorne YYYY-MM-DD. Se não der para determinar → "none".
 
 JSON:
 {
@@ -147,6 +164,7 @@ JSON:
   "valor": 0,
   "descricao": "none",
   "data": "hoje",
+  "vencimento": "none",
   "categoria": "none",
   "conta": "none",
   "contexto": "CPF",
@@ -156,6 +174,7 @@ JSON:
   "message": "none"
 }
 `;
+};
 
 const getAnalysisPrompt = (userMessage: string, acao: AcaoType, data: AnalysisData) => `
 Você é o Nexus Wealth, Assistente Financeiro com comportamento humano.
@@ -306,7 +325,114 @@ const fetchAnalysisData = async (periodo?: string): Promise<AnalysisData> => {
   };
 };
 
+const fmtBRL = (value: number) =>
+  value.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+
+const saveBill = async (bill: { descricao: string; valor: number; due_date: string; entity: EntityType }) =>
+  supabase.from('bills').insert([{
+    description: bill.descricao,
+    amount: bill.valor,
+    due_date: bill.due_date,
+    entity: bill.entity,
+  }]);
+
 // ─── Action Handlers ──────────────────────────────────────────────────────────
+
+const handleCriarContaPagar = async (ctx: Context, data: NexusResponse) => {
+  const chatId = ctx.chat!.id;
+
+  if (!data.descricao || data.descricao === 'none' || !data.valor || data.valor <= 0) {
+    await ctx.reply('Nexus: Não consegui identificar a conta. Tente: "adicionar conta Luz R$150 vence dia 10/04"');
+    return;
+  }
+
+  if (!data.vencimento || data.vencimento === 'none') {
+    pendingBillCreations.set(chatId, {
+      descricao: data.descricao,
+      valor: data.valor,
+      entity: data.contexto,
+    });
+    await ctx.reply(`Entendido — conta *${data.descricao}* de ${fmtBRL(data.valor)}.\n\nQual é a data de vencimento? (ex: 05/04/2026 ou 2026-04-05)`);
+    return;
+  }
+
+  const { error } = await saveBill({ descricao: data.descricao, valor: data.valor, due_date: data.vencimento, entity: data.contexto });
+  if (error) { await ctx.reply('Erro ao salvar a conta. Tente novamente.'); return; }
+
+  const dueFormatted = new Date(data.vencimento + 'T12:00:00').toLocaleDateString('pt-BR');
+  await ctx.reply(`✅ Conta *${data.descricao}* de ${fmtBRL(data.valor)} registrada — vence em ${dueFormatted}.`);
+};
+
+const handleListarContasPagar = async (ctx: Context) => {
+  const { data: bills, error } = await supabase
+    .from('bills')
+    .select('description, amount, due_date, paid_at, entity')
+    .is('paid_at', null)
+    .order('due_date', { ascending: true })
+    .limit(15);
+
+  if (error || !bills?.length) {
+    await ctx.reply('Nenhuma conta a pagar encontrada.');
+    return;
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const lines = bills.map((b: { description: string; amount: number; due_date: string; entity: string }) => {
+    const due = new Date(b.due_date + 'T00:00:00');
+    const diffDays = Math.round((due.getTime() - today.getTime()) / 86400000);
+    const icon = diffDays < 0 ? '🔴' : diffDays <= 3 ? '🟡' : '⚪';
+    const label = diffDays < 0
+      ? `venceu há ${Math.abs(diffDays)}d`
+      : diffDays === 0 ? 'vence hoje'
+      : `vence em ${diffDays}d`;
+    return `${icon} *${b.description}* — ${fmtBRL(Number(b.amount))} (${label})`;
+  });
+
+  await ctx.reply(`📋 *Contas a Pagar*\n\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+};
+
+const handleMarcarContaPaga = async (ctx: Context, data: NexusResponse) => {
+  if (!data.descricao || data.descricao === 'none') {
+    await ctx.reply('Nexus: Qual conta você quer marcar como paga?');
+    return;
+  }
+
+  const term = data.descricao.toLowerCase();
+
+  const { data: bills, error } = await supabase
+    .from('bills')
+    .select('id, description, amount, due_date')
+    .is('paid_at', null)
+    .ilike('description', `%${term}%`)
+    .order('due_date', { ascending: true })
+    .limit(5);
+
+  if (error || !bills?.length) {
+    await ctx.reply(`Nenhuma conta pendente encontrada com "${data.descricao}".`);
+    return;
+  }
+
+  // Se encontrou exatamente uma, marca como paga
+  if (bills.length === 1) {
+    const bill = bills[0];
+    const { error: updateError } = await supabase
+      .from('bills')
+      .update({ paid_at: new Date().toISOString() })
+      .eq('id', bill.id);
+
+    if (updateError) { await ctx.reply('Erro ao atualizar a conta. Tente novamente.'); return; }
+    await ctx.reply(`✅ Conta *${bill.description}* de ${fmtBRL(Number(bill.amount))} marcada como paga!`, { parse_mode: 'Markdown' });
+    return;
+  }
+
+  // Múltiplas — lista para o usuário escolher
+  const list = (bills as Array<{ id: string; description: string; amount: number; due_date: string }>)
+    .map((b, i) => `${i + 1}. *${b.description}* — ${fmtBRL(Number(b.amount))} (vence ${new Date(b.due_date + 'T12:00:00').toLocaleDateString('pt-BR')})`)
+    .join('\n');
+  await ctx.reply(`Encontrei ${bills.length} contas com esse nome:\n\n${list}\n\nSeja mais específico (ex: "marcar conta Luz de abril como paga").`, { parse_mode: 'Markdown' });
+};
 
 const handleCriarLancamento = async (ctx: Context, data: NexusResponse, originalText: string) => {
   const chatId = ctx.chat!.id;
@@ -441,6 +567,35 @@ const registerHandlers = (bot: Telegraf, groq: Groq) => {
       return;
     }
 
+    const pendingBill = pendingBillCreations.get(chatId);
+    if (pendingBill) {
+      // Tenta interpretar o texto como uma data
+      const normalized = text.trim().replace(/(\d{2})\/(\d{2})\/(\d{4})/, '$3-$2-$1');
+      const isoDate = /^\d{4}-\d{2}-\d{2}$/.test(normalized)
+        ? normalized
+        : (() => {
+            const match = text.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{4}))?/);
+            if (match) {
+              const year = match[3] ?? new Date().getFullYear().toString();
+              return `${year}-${String(match[2]).padStart(2, '0')}-${String(match[1]).padStart(2, '0')}`;
+            }
+            return null;
+          })();
+
+      if (!isoDate) {
+        await ctx.reply('Data inválida. Use o formato DD/MM/AAAA (ex: 10/04/2026).');
+        return;
+      }
+
+      const { error } = await saveBill({ ...pendingBill, due_date: isoDate });
+      if (error) { await ctx.reply('Erro ao salvar a conta. Tente novamente.'); return; }
+      pendingBillCreations.delete(chatId);
+
+      const dueFormatted = new Date(isoDate + 'T12:00:00').toLocaleDateString('pt-BR');
+      await ctx.reply(`✅ Conta *${pendingBill.descricao}* de ${fmtBRL(pendingBill.valor)} registrada — vence em ${dueFormatted}.`, { parse_mode: 'Markdown' });
+      return;
+    }
+
     try {
       const raw = await generateJSON(groq, getClassifierPrompt(text));
       const cleaned = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
@@ -477,6 +632,18 @@ const registerHandlers = (bot: Telegraf, groq: Groq) => {
         case 'editar_lancamento':
         case 'remover_lancamento':
           await ctx.reply(`Nexus: ${data.message}\n\n⚠️ Edição e remoção ainda estão em desenvolvimento. Use o dashboard para gerenciar esses lançamentos.`);
+          break;
+
+        case 'criar_conta_pagar':
+          await handleCriarContaPagar(ctx, data);
+          break;
+
+        case 'listar_contas_pagar':
+          await handleListarContasPagar(ctx);
+          break;
+
+        case 'marcar_conta_paga':
+          await handleMarcarContaPaga(ctx, data);
           break;
 
         default:
