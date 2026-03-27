@@ -204,6 +204,16 @@ const VALID_ACOES: AcaoType[] = [
   'criar_conta_pagar', 'listar_contas_pagar', 'marcar_conta_paga', 'conversa',
 ];
 
+const hasFinancialIntent = (raw: Pick<NexusResponse, 'tipo' | 'valor'>) => {
+  const t = String(raw.tipo ?? '').toLowerCase();
+  return raw.valor > 0 && (
+    t.includes('expense') || t.includes('income') ||
+    t.includes('despesa') || t.includes('gasto') ||
+    t.includes('receita') || t.includes('entrada') ||
+    t.includes('saida') || t.includes('saída')
+  );
+};
+
 const normalizeResponse = (raw: NexusResponse, originalText: string): NexusResponse => {
   // Normaliza acao
   let acao = raw.acao as string;
@@ -224,13 +234,12 @@ const normalizeResponse = (raw: NexusResponse, originalText: string): NexusRespo
     } else if (a.includes('conta') && a.includes('pagar')) {
       acao = 'criar_conta_pagar';
     } else {
-      // Último recurso: se tem valor > 0 e tipo de transação, é um lançamento
-      const t = (raw.tipo as string)?.toLowerCase() ?? '';
-      const hasFinancialType = t.includes('expense') || t.includes('income') ||
-        t.includes('despesa') || t.includes('gasto') || t.includes('receita') ||
-        t.includes('entrada') || t.includes('saida') || t.includes('saída');
-      acao = (raw.valor > 0 && hasFinancialType) ? 'criar_lancamento' : 'conversa';
+      acao = hasFinancialIntent(raw) ? 'criar_lancamento' : 'conversa';
     }
+  }
+
+  if (acao === 'conversa' && hasFinancialIntent(raw)) {
+    acao = 'criar_lancamento';
   }
 
   // Normaliza tipo
