@@ -205,6 +205,14 @@ const VALID_ACOES: AcaoType[] = [
   'criar_conta_pagar', 'listar_contas_pagar', 'marcar_conta_paga', 'conversa',
 ];
 
+const INTENT_PATTERNS = {
+  remover_lancamento: /\b(remover|remove|removi|apagar|apaga|apague|excluir|exclui|deletar|deleta|cancelar|cancela|tirar|tira|estornar|estorna|desfazer|desfaz)\b/,
+  editar_lancamento: /\b(editar|edita|corrigir|corrige|alterar|altera|ajustar|ajusta|mudar|muda|atualizar|atualiza|revisar|revisa)\b/,
+  listar_lancamentos: /\b(listar|lista|mostrar|mostra|exibir|exibe|ver|veja|quais|todos)\b.*\b(lancamento|lancamentos|gastos|despesas|entradas|transacoes|transacao)\b|\bextrato\b/,
+  buscar_lancamento: /\b(buscar|busca|procurar|procura|encontrar|encontra|localizar|localiza|filtrar|filtra)\b.*\b(lancamento|lancamentos|gasto|gastos|despesa|despesas|entrada|entradas|transacao|transacoes)\b/,
+  criar_lancamento: /\b(gastei|gastar|gasto|paguei|pagar|comprei|comprar|desembolsei|recebi|receber|ganhei|ganhar|entrou|caiu|saiu|lancar|lanco|lan?ar|registrar|registro|cadastrar|cadastro|adicionar|adiciona|incluir|inclui|anotar|anota|colocar|coloca)\b/,
+} as const;
+
 const hasFinancialIntent = (raw: Pick<NexusResponse, 'tipo' | 'valor'>) => {
   const t = String(raw.tipo ?? '').toLowerCase();
   return raw.valor > 0 && (
@@ -244,12 +252,16 @@ const normalizeResponse = (raw: NexusResponse, originalText: string): NexusRespo
   }
 
   const normalizedOriginal = normalizeText(originalText);
-  if (acao === 'conversa') {
-    if (/(remover|apagar|excluir)/.test(normalizedOriginal)) {
-      acao = 'remover_lancamento';
-    } else if (/(editar|corrigir|alterar)/.test(normalizedOriginal)) {
-      acao = 'editar_lancamento';
-    }
+  if (INTENT_PATTERNS.remover_lancamento.test(normalizedOriginal)) {
+    acao = 'remover_lancamento';
+  } else if (INTENT_PATTERNS.editar_lancamento.test(normalizedOriginal)) {
+    acao = 'editar_lancamento';
+  } else if (INTENT_PATTERNS.buscar_lancamento.test(normalizedOriginal)) {
+    acao = 'buscar_lancamento';
+  } else if (INTENT_PATTERNS.listar_lancamentos.test(normalizedOriginal)) {
+    acao = 'listar_lancamentos';
+  } else if ((acao === 'conversa' || acao === 'buscar_lancamento' || acao === 'listar_lancamentos') && (INTENT_PATTERNS.criar_lancamento.test(normalizedOriginal) || hasFinancialIntent(raw))) {
+    acao = 'criar_lancamento';
   }
 
   // Normaliza tipo
@@ -261,6 +273,15 @@ const normalizeResponse = (raw: NexusResponse, originalText: string): NexusRespo
     tipo = 'income';
   } else {
     tipo = raw.tipo === 'income' || raw.tipo === 'expense' ? raw.tipo : 'none';
+  }
+
+  if (tipo === 'none') {
+    if (/\b(recebi|receber|ganhei|ganhar|entrou|caiu|pix recebido|deposito|depósito)\b/.test(normalizedOriginal)) {
+      tipo = 'income';
+    } else if ((INTENT_PATTERNS.criar_lancamento.test(normalizedOriginal) || raw.valor > 0) &&
+      /\b(gastei|gastar|gasto|paguei|pagar|comprei|comprar|desembolsei|anotar|anota|colocar|coloca|adicionar|adiciona|cadastrar|cadastro|incluir|inclui)\b/.test(normalizedOriginal)) {
+      tipo = 'expense';
+    }
   }
 
   // Normaliza contexto (entidade CPF/CNPJ)
