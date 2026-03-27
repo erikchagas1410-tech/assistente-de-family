@@ -482,26 +482,49 @@ const handleAnalise = async (ctx: Context, userMessage: string, acao: AcaoType, 
   }
 };
 
-const CONVERSATION_SYSTEM = `Você é o Nexus Wealth, Assistente Financeiro, Fiscal e Contábil completo.
+const buildConversationSystem = (data: AnalysisData) => {
+  const ratio = data.totalEntradas > 0
+    ? ((data.totalSaidas / data.totalEntradas) * 100).toFixed(0)
+    : 'N/A';
+  const topGastos = data.transacoes
+    .filter((t) => t.tipo === 'expense')
+    .reduce<Record<string, number>>((acc, t) => { acc[t.descricao] = (acc[t.descricao] ?? 0) + t.valor; return acc; }, {});
+  const top3 = Object.entries(topGastos).sort((a, b) => b[1] - a[1]).slice(0, 3)
+    .map(([k, v]) => `${k}: R$${v.toFixed(2)}`).join(', ');
+
+  return `Você é o Nexus Wealth, Assistente Financeiro, Fiscal e Contábil completo.
 Personalidade: humano, direto, inteligente, prático, confiável. Você é parceiro financeiro — não robô.
 
+SITUAÇÃO FINANCEIRA ATUAL (${data.periodo}):
+- Entradas: R$ ${data.totalEntradas.toFixed(2)}
+- Saídas: R$ ${data.totalSaidas.toFixed(2)}
+- Saldo: R$ ${data.saldo.toFixed(2)}
+- Comprometimento: ${ratio}% das entradas
+- Top gastos: ${top3 || 'sem dados'}
+- Por conta: ${JSON.stringify(data.porConta)}
+- CPF vs CNPJ: ${JSON.stringify(data.porContexto)}
+
 REGRAS DE COMPORTAMENTO:
+- Sempre baseie suas respostas nos dados financeiros reais acima
 - Nunca pergunte "como posso ajudar?" — isso é genérico demais
-- Quando o usuário descrever situação financeira → dê diagnóstico direto com o que foi dito
+- Quando o usuário pedir dicas/sugestões → use os dados acima para ser específico
 - Quando faltarem dados → faça NO MÁXIMO uma pergunta por resposta
-- Seja específico, nunca vago
 - Se o usuário mencionar renda/gastos → analise e oriente imediatamente
-- Se estiver perdido → simplifique e dê próximo passo concreto
 - Se estiver errando → corrija com respeito
-- Lembre que o usuário pode lançar transações aqui mesmo pelo Telegram
+- O usuário pode lançar transações, contas a pagar e marcar pagamentos aqui no Telegram
 - Máximo 180 palavras por resposta`;
+};
 
 const handleConversa = async (ctx: Context, userMessage: string, groq: Groq) => {
   const chatId = ctx.chat!.id;
   const history = conversationHistory.get(chatId) ?? [];
 
+  // Busca dados financeiros do mês atual para enriquecer o contexto
+  const financialData = await fetchAnalysisData('mes_atual');
+  const systemPrompt = buildConversationSystem(financialData);
+
   const messages: Groq.Chat.ChatCompletionMessageParam[] = [
-    { role: 'system', content: CONVERSATION_SYSTEM },
+    { role: 'system', content: systemPrompt },
     ...history.slice(-MAX_HISTORY).map((m) => ({ role: m.role, content: m.content })),
     { role: 'user', content: userMessage },
   ];
