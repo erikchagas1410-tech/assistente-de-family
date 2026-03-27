@@ -1,8 +1,8 @@
 import Groq from 'groq-sdk';
-import { Context, Telegraf } from 'telegraf';
-import { message } from 'telegraf/filters';
 import { Update } from 'telegraf/types';
 import { BANK_ACCOUNTS, BANK_ACCOUNT_BY_ID, isValidBankAccount } from '@/lib/banks';
+
+type BotCtx = { chat: { id: number }; reply: (text: string, opts?: { parse_mode?: 'Markdown' }) => Promise<unknown> };
 import { supabase } from '@/lib/supabase/client';
 import { BankAccountId, EntityType, TransactionType } from '@/types/finance';
 
@@ -76,11 +76,6 @@ interface AnalysisData {
   porContexto: Record<string, { entradas: number; saidas: number; saldo: number }>;
 }
 
-interface TelegramRuntime {
-  bot: Telegraf;
-  groq: Groq;
-}
-
 interface PendingBillCreation {
   descricao: string;
   valor: number;
@@ -96,7 +91,6 @@ interface HistoryMessage { role: 'user' | 'assistant'; content: string }
 const conversationHistory = new Map<number, HistoryMessage[]>();
 const MAX_HISTORY = 12;
 const supportedBankList = BANK_ACCOUNTS.map((a) => `${a.id} (${a.label})`).join(', ');
-let runtime: TelegramRuntime | null = null;
 
 // ─── Groq Helpers ─────────────────────────────────────────────────────────────
 
@@ -405,7 +399,7 @@ const saveBill = async (bill: { descricao: string; valor: number; due_date: stri
 
 // ─── Action Handlers ──────────────────────────────────────────────────────────
 
-const handleCriarContaPagar = async (ctx: Context, data: NexusResponse) => {
+const handleCriarContaPagar = async (ctx: BotCtx, data: NexusResponse) => {
   const chatId = ctx.chat!.id;
 
   if (!data.descricao || data.descricao === 'none' || !data.valor || data.valor <= 0) {
@@ -430,7 +424,7 @@ const handleCriarContaPagar = async (ctx: Context, data: NexusResponse) => {
   await ctx.reply(`✅ Conta *${data.descricao}* de ${fmtBRL(data.valor)} registrada — vence em ${dueFormatted}.`);
 };
 
-const handleListarContasPagar = async (ctx: Context) => {
+const handleListarContasPagar = async (ctx: BotCtx) => {
   const { data: bills, error } = await supabase
     .from('bills')
     .select('description, amount, due_date, paid_at, entity')
@@ -460,7 +454,7 @@ const handleListarContasPagar = async (ctx: Context) => {
   await ctx.reply(`📋 *Contas a Pagar*\n\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
 };
 
-const handleMarcarContaPaga = async (ctx: Context, data: NexusResponse) => {
+const handleMarcarContaPaga = async (ctx: BotCtx, data: NexusResponse) => {
   if (!data.descricao || data.descricao === 'none') {
     await ctx.reply('Nexus: Qual conta você quer marcar como paga?');
     return;
@@ -501,7 +495,7 @@ const handleMarcarContaPaga = async (ctx: Context, data: NexusResponse) => {
   await ctx.reply(`Encontrei ${bills.length} contas com esse nome:\n\n${list}\n\nSeja mais específico (ex: "marcar conta Luz de abril como paga").`, { parse_mode: 'Markdown' });
 };
 
-const handleCriarLancamento = async (ctx: Context, data: NexusResponse, originalText: string) => {
+const handleCriarLancamento = async (ctx: BotCtx, data: NexusResponse, originalText: string) => {
   const chatId = ctx.chat!.id;
 
   if (data.tipo === 'none' || !data.valor || data.valor <= 0) {
@@ -537,7 +531,7 @@ const handleCriarLancamento = async (ctx: Context, data: NexusResponse, original
   await ctx.reply(`Nexus: ${data.message}`);
 };
 
-const handleAnalise = async (ctx: Context, userMessage: string, acao: AcaoType, periodo: string | undefined, groq: Groq) => {
+const handleAnalise = async (ctx: BotCtx, userMessage: string, acao: AcaoType, periodo: string | undefined, groq: Groq) => {
   await ctx.reply('Analisando seus dados...');
   const analysisData = await fetchAnalysisData(periodo);
   try {
@@ -582,7 +576,7 @@ REGRAS DE COMPORTAMENTO:
 - Máximo 180 palavras por resposta`;
 };
 
-const handleConversa = async (ctx: Context, userMessage: string, groq: Groq) => {
+const handleConversa = async (ctx: BotCtx, userMessage: string, groq: Groq) => {
   const chatId = ctx.chat!.id;
   const history = conversationHistory.get(chatId) ?? [];
 
@@ -613,7 +607,7 @@ const handleConversa = async (ctx: Context, userMessage: string, groq: Groq) => 
   await ctx.reply(response);
 };
 
-const handleListagem = async (ctx: Context, userMessage: string, acao: AcaoType, periodo: string | undefined, termo: string | undefined, groq: Groq) => {
+const handleListagem = async (ctx: BotCtx, userMessage: string, acao: AcaoType, periodo: string | undefined, termo: string | undefined, groq: Groq) => {
   await ctx.reply('Buscando lançamentos...');
   const analysisData = await fetchAnalysisData(periodo);
 
@@ -632,141 +626,136 @@ const handleListagem = async (ctx: Context, userMessage: string, acao: AcaoType,
   }
 };
 
-// ─── Bot Registration ─────────────────────────────────────────────────────────
+// ─── Telegram Send Helper (direto, sem Telegraf middleware) ───────────────────
 
-const registerHandlers = (bot: Telegraf, groq: Groq) => {
-  bot.on(message('text'), async (ctx) => {
-    const text = ctx.message.text.trim();
-    const chatId = ctx.chat.id;
-    const pending = pendingTransactions.get(chatId);
-
-    if (pending) {
-      const bankAccount = findBankFromText(text, pending.contexto);
-      if (!bankAccount) {
-        await ctx.reply(`Não consegui identificar o banco.\n\n${getBankQuestion()}`);
-        return;
-      }
-      const { error } = await saveTransaction({ ...pending, bank_account: bankAccount });
-      if (error) {
-        console.error('Supabase Error:', error);
-        await ctx.reply('Erro ao salvar a transação.');
-        return;
-      }
-      pendingTransactions.delete(chatId);
-      await ctx.reply(`Lançamento salvo no ${BANK_ACCOUNT_BY_ID[bankAccount].label}.`);
-      return;
-    }
-
-    const pendingBill = pendingBillCreations.get(chatId);
-    if (pendingBill) {
-      // Tenta interpretar o texto como uma data
-      const normalized = text.trim().replace(/(\d{2})\/(\d{2})\/(\d{4})/, '$3-$2-$1');
-      const isoDate = /^\d{4}-\d{2}-\d{2}$/.test(normalized)
-        ? normalized
-        : (() => {
-            const match = text.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{4}))?/);
-            if (match) {
-              const year = match[3] ?? new Date().getFullYear().toString();
-              return `${year}-${String(match[2]).padStart(2, '0')}-${String(match[1]).padStart(2, '0')}`;
-            }
-            return null;
-          })();
-
-      if (!isoDate) {
-        await ctx.reply('Data inválida. Use o formato DD/MM/AAAA (ex: 10/04/2026).');
-        return;
-      }
-
-      const { error } = await saveBill({ ...pendingBill, due_date: isoDate });
-      if (error) { await ctx.reply('Erro ao salvar a conta. Tente novamente.'); return; }
-      pendingBillCreations.delete(chatId);
-
-      const dueFormatted = new Date(isoDate + 'T12:00:00').toLocaleDateString('pt-BR');
-      await ctx.reply(`✅ Conta *${pendingBill.descricao}* de ${fmtBRL(pendingBill.valor)} registrada — vence em ${dueFormatted}.`, { parse_mode: 'Markdown' });
-      return;
-    }
-
-    try {
-      const raw = await generateJSON(groq, getClassifierPrompt(text));
-      const cleaned = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
-
-      let data: NexusResponse;
-      try {
-        const parsed = JSON.parse(cleaned) as NexusResponse;
-        data = normalizeResponse(parsed, text);
-      } catch (parseError) {
-        console.error('JSON Parse Error:', parseError, 'Raw:', cleaned);
-        await ctx.reply('Não consegui processar sua solicitação. Tente novamente.');
-        return;
-      }
-
-      switch (data.acao) {
-        case 'criar_lancamento':
-          await handleCriarLancamento(ctx, data, text);
-          break;
-
-        case 'analisar_saude_financeira':
-        case 'resumo_periodo':
-        case 'resumo_por_categoria':
-        case 'resumo_por_conta':
-        case 'sugerir_ajustes':
-        case 'sugerir_investimentos':
-        case 'comparar_periodos':
-          await handleAnalise(ctx, text, data.acao, data.periodo, groq);
-          break;
-
-        case 'listar_lancamentos':
-        case 'buscar_lancamento':
-          await handleListagem(ctx, text, data.acao, data.periodo, data.termo, groq);
-          break;
-
-        case 'editar_lancamento':
-        case 'remover_lancamento':
-          await ctx.reply(`Nexus: ${data.message}\n\n⚠️ Edição e remoção ainda estão em desenvolvimento. Use o dashboard para gerenciar esses lançamentos.`);
-          break;
-
-        case 'criar_conta_pagar':
-          await handleCriarContaPagar(ctx, data);
-          break;
-
-        case 'listar_contas_pagar':
-          await handleListarContasPagar(ctx);
-          break;
-
-        case 'marcar_conta_paga':
-          await handleMarcarContaPaga(ctx, data);
-          break;
-
-        default:
-          await handleConversa(ctx, text, groq);
-      }
-    } catch (err) {
-      console.error('Groq API Error:', { error: err, text, chatId });
-      await ctx.reply(getErrorMessage(err));
-    }
+const sendMessage = async (chatId: number, text: string, parseMode?: 'Markdown') => {
+  const token = process.env.TELEGRAM_BOT_TOKEN!;
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text, ...(parseMode && { parse_mode: parseMode }) }),
   });
 };
 
-// ─── Runtime ──────────────────────────────────────────────────────────────────
+// Shim de ctx para reutilizar os handlers existentes sem mudança
+const makeCtx = (chatId: number) => ({
+  chat: { id: chatId },
+  reply: (text: string, opts?: { parse_mode?: 'Markdown' }) =>
+    sendMessage(chatId, text, opts?.parse_mode),
+});
 
-const getTelegramRuntime = (): TelegramRuntime => {
-  if (runtime) return runtime;
+// ─── Main Handler ─────────────────────────────────────────────────────────────
 
-  const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
-  const groqApiKey = process.env.GROQ_API_KEY;
-
-  if (!telegramBotToken) throw new Error('TELEGRAM_BOT_TOKEN is not defined.');
-  if (!groqApiKey) throw new Error('GROQ_API_KEY is not defined.');
-
-  const bot = new Telegraf(telegramBotToken);
-  const groq = new Groq({ apiKey: groqApiKey });
-
-  registerHandlers(bot, groq);
-  runtime = { bot, groq };
-  return runtime;
+let groqInstance: Groq | null = null;
+const getGroq = () => {
+  if (!groqInstance) groqInstance = new Groq({ apiKey: process.env.GROQ_API_KEY! });
+  return groqInstance;
 };
 
-export const telegramWebhookHandler = async (body: Update) => {
-  const { bot } = getTelegramRuntime();
-  await bot.handleUpdate(body);
+export const handleTelegramUpdate = async (body: Update) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const message = (body as any).message as { chat: { id: number }; text?: string } | undefined;
+  if (!message?.text) return;
+
+  const chatId = message.chat.id;
+  const text = message.text.trim();
+  const groq = getGroq();
+  const ctx = makeCtx(chatId);
+
+  // ── Pending transaction (aguardando banco) ──────────────────────────────────
+  const pending = pendingTransactions.get(chatId);
+  if (pending) {
+    const bankAccount = findBankFromText(text, pending.contexto);
+    if (!bankAccount) {
+      await ctx.reply(`Não consegui identificar o banco.\n\n${getBankQuestion()}`);
+      return;
+    }
+    const { error } = await saveTransaction({ ...pending, bank_account: bankAccount });
+    if (error) {
+      console.error('[bot] Supabase Error:', error);
+      await ctx.reply('Erro ao salvar a transação.');
+      return;
+    }
+    pendingTransactions.delete(chatId);
+    await ctx.reply(`Lançamento salvo no ${BANK_ACCOUNT_BY_ID[bankAccount].label}.`);
+    return;
+  }
+
+  // ── Pending bill (aguardando data de vencimento) ────────────────────────────
+  const pendingBill = pendingBillCreations.get(chatId);
+  if (pendingBill) {
+    const normalized = text.trim().replace(/(\d{2})\/(\d{2})\/(\d{4})/, '$3-$2-$1');
+    const isoDate = /^\d{4}-\d{2}-\d{2}$/.test(normalized)
+      ? normalized
+      : (() => {
+          const match = text.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{4}))?/);
+          if (match) {
+            const year = match[3] ?? new Date().getFullYear().toString();
+            return `${year}-${String(match[2]).padStart(2, '0')}-${String(match[1]).padStart(2, '0')}`;
+          }
+          return null;
+        })();
+
+    if (!isoDate) {
+      await ctx.reply('Data inválida. Use o formato DD/MM/AAAA (ex: 10/04/2026).');
+      return;
+    }
+    const { error } = await saveBill({ ...pendingBill, due_date: isoDate });
+    if (error) { await ctx.reply('Erro ao salvar a conta. Tente novamente.'); return; }
+    pendingBillCreations.delete(chatId);
+    const dueFormatted = new Date(isoDate + 'T12:00:00').toLocaleDateString('pt-BR');
+    await ctx.reply(`✅ Conta *${pendingBill.descricao}* de ${fmtBRL(pendingBill.valor)} registrada — vence em ${dueFormatted}.`, { parse_mode: 'Markdown' });
+    return;
+  }
+
+  // ── Classify + Dispatch ─────────────────────────────────────────────────────
+  try {
+    const raw = await generateJSON(groq, getClassifierPrompt(text));
+    const cleaned = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
+
+    let data: NexusResponse;
+    try {
+      data = normalizeResponse(JSON.parse(cleaned) as NexusResponse, text);
+    } catch {
+      await ctx.reply('Não consegui processar sua solicitação. Tente novamente.');
+      return;
+    }
+
+    switch (data.acao) {
+      case 'criar_lancamento':
+        await handleCriarLancamento(ctx as never, data, text);
+        break;
+      case 'analisar_saude_financeira':
+      case 'resumo_periodo':
+      case 'resumo_por_categoria':
+      case 'resumo_por_conta':
+      case 'sugerir_ajustes':
+      case 'sugerir_investimentos':
+      case 'comparar_periodos':
+        await handleAnalise(ctx as never, text, data.acao, data.periodo, groq);
+        break;
+      case 'listar_lancamentos':
+      case 'buscar_lancamento':
+        await handleListagem(ctx as never, text, data.acao, data.periodo, data.termo, groq);
+        break;
+      case 'editar_lancamento':
+      case 'remover_lancamento':
+        await ctx.reply('Edição e remoção devem ser feitas no dashboard. Posso ajudar com outra coisa?');
+        break;
+      case 'criar_conta_pagar':
+        await handleCriarContaPagar(ctx as never, data);
+        break;
+      case 'listar_contas_pagar':
+        await handleListarContasPagar(ctx as never);
+        break;
+      case 'marcar_conta_paga':
+        await handleMarcarContaPaga(ctx as never, data);
+        break;
+      default:
+        await handleConversa(ctx as never, text, groq);
+    }
+  } catch (err) {
+    console.error('[bot] Error:', err);
+    await ctx.reply(getErrorMessage(err));
+  }
 };
