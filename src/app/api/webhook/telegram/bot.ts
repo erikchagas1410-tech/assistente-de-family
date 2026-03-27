@@ -80,6 +80,10 @@ interface TelegramRuntime {
 // ─── State ────────────────────────────────────────────────────────────────────
 
 const pendingTransactions = new Map<number, PendingTransaction>();
+
+interface HistoryMessage { role: 'user' | 'assistant'; content: string }
+const conversationHistory = new Map<number, HistoryMessage[]>();
+const MAX_HISTORY = 12;
 const supportedBankList = BANK_ACCOUNTS.map((a) => `${a.id} (${a.label})`).join(', ');
 let runtime: TelegramRuntime | null = null;
 
@@ -112,55 +116,44 @@ const generateText = async (groq: Groq, prompt: string): Promise<string> => {
 // ─── Prompts ──────────────────────────────────────────────────────────────────
 
 const getClassifierPrompt = (text: string) => `
-Você é o Nexus Wealth, um Assistente Financeiro, Fiscal e Contábil completo com comportamento humano.
+Classifique a intenção do usuário e retorne JSON. Nada mais.
 
-Sua personalidade: profissional, direta, inteligente, confiável, sem enrolação.
-Você age como parceiro financeiro, não como robô.
+Mensagem: "${text}"
 
-O usuário disse: "${text}"
+AÇÕES:
+- transação (gastei, paguei, recebi, lançar, registrar, entrou, saiu) → criar_lancamento
+- remover/apagar/excluir → remover_lancamento
+- editar/corrigir/alterar → editar_lancamento
+- listar/mostrar lançamentos → listar_lancamentos
+- buscar lançamento → buscar_lancamento
+- resumo do mês/período → resumo_periodo
+- gastos por categoria → resumo_por_categoria
+- gastos por banco/conta → resumo_por_conta
+- saúde financeira/como estou → analisar_saude_financeira
+- comparar períodos → comparar_periodos
+- onde economizar/ajustes → sugerir_ajustes
+- investir/investimento → sugerir_investimentos
+- tudo mais → conversa
 
-FLUXO DE ANÁLISE:
-1. O usuário quer conversar, lançar, entender ou analisar?
-2. É PF (CPF), PJ (CNPJ) ou misto?
-3. Há dados financeiros ou intenção operacional?
+BANCOS VÁLIDOS: ${supportedBankList}
+CPF por padrão. CNPJ só se mencionar empresa/PJ/CNPJ.
+Banco não identificado → needs_bank: true, conta: "none".
+Receita/entrada → tipo: "income". Gasto/saída → tipo: "expense".
 
-MAPEAMENTO DE INTENÇÃO → AÇÃO:
-- "lança", "adiciona", "registra", "gastei", "paguei", "recebi", "entrou", "saiu" → criar_lancamento
-- "remove", "apaga", "exclui", "cancela" → remover_lancamento
-- "corrige", "edita", "altera", "muda" → editar_lancamento
-- "lista", "mostra", "quero ver", "me mostra" → listar_lancamentos
-- "busca", "encontra", "procura" → buscar_lancamento
-- "como foi esse mês", "resumo do período", "resumo do mês" → resumo_periodo
-- "onde gasto mais", "por categoria", "categorias" → resumo_por_categoria
-- "por banco", "por conta", "contas" → resumo_por_conta
-- "como estou financeiramente", "saúde financeira", "situação" → analisar_saude_financeira
-- "comparar", "mês anterior", "comparação" → comparar_periodos
-- "o que ajustar", "onde economizar", "cortar gastos" → sugerir_ajustes
-- "posso investir", "onde investir", "investimento" → sugerir_investimentos
-- qualquer dúvida, pergunta, conversa → conversa
-
-REGRAS PARA LANÇAMENTOS:
-- Bancos suportados APENAS: ${supportedBankList}
-- Santander existe apenas como santander_pf
-- Assuma CPF por padrão, salvo menção a empresa, negócio, PJ ou CNPJ
-- Se o banco não estiver claro, retorne needs_bank: true e conta: "none"
-- Lançamento positivo / receita → tipo: "income"
-- Gasto / pagamento → tipo: "expense"
-
-RETORNE APENAS JSON VÁLIDO:
+JSON:
 {
-  "acao": "criar_lancamento",
-  "tipo": "income",
+  "acao": "conversa",
+  "tipo": "none",
   "valor": 0,
-  "descricao": "descricao curta",
+  "descricao": "none",
   "data": "hoje",
-  "categoria": "categoria",
+  "categoria": "none",
   "conta": "none",
   "contexto": "CPF",
   "needs_bank": false,
   "periodo": "none",
   "termo": "none",
-  "message": "resposta ao usuario em portugues"
+  "message": "none"
 }
 `;
 
@@ -363,6 +356,47 @@ const handleAnalise = async (ctx: Context, userMessage: string, acao: AcaoType, 
   }
 };
 
+const CONVERSATION_SYSTEM = `Você é o Nexus Wealth, Assistente Financeiro, Fiscal e Contábil completo.
+Personalidade: humano, direto, inteligente, prático, confiável. Você é parceiro financeiro — não robô.
+
+REGRAS DE COMPORTAMENTO:
+- Nunca pergunte "como posso ajudar?" — isso é genérico demais
+- Quando o usuário descrever situação financeira → dê diagnóstico direto com o que foi dito
+- Quando faltarem dados → faça NO MÁXIMO uma pergunta por resposta
+- Seja específico, nunca vago
+- Se o usuário mencionar renda/gastos → analise e oriente imediatamente
+- Se estiver perdido → simplifique e dê próximo passo concreto
+- Se estiver errando → corrija com respeito
+- Lembre que o usuário pode lançar transações aqui mesmo pelo Telegram
+- Máximo 180 palavras por resposta`;
+
+const handleConversa = async (ctx: Context, userMessage: string, groq: Groq) => {
+  const chatId = ctx.chat!.id;
+  const history = conversationHistory.get(chatId) ?? [];
+
+  const messages: Groq.Chat.ChatCompletionMessageParam[] = [
+    { role: 'system', content: CONVERSATION_SYSTEM },
+    ...history.slice(-MAX_HISTORY).map((m) => ({ role: m.role, content: m.content })),
+    { role: 'user', content: userMessage },
+  ];
+
+  const completion = await groq.chat.completions.create({
+    model: ANALYSIS_MODEL,
+    messages,
+    temperature: 0.8,
+    max_tokens: 512,
+  });
+
+  const response = completion.choices[0]?.message?.content ?? 'Não consegui processar. Tente novamente.';
+
+  history.push({ role: 'user', content: userMessage });
+  history.push({ role: 'assistant', content: response });
+  if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
+  conversationHistory.set(chatId, history);
+
+  await ctx.reply(response);
+};
+
 const handleListagem = async (ctx: Context, userMessage: string, acao: AcaoType, periodo: string | undefined, termo: string | undefined, groq: Groq) => {
   await ctx.reply('Buscando lançamentos...');
   const analysisData = await fetchAnalysisData(periodo);
@@ -446,7 +480,7 @@ const registerHandlers = (bot: Telegraf, groq: Groq) => {
           break;
 
         default:
-          await ctx.reply(`Nexus: ${data.message}`);
+          await handleConversa(ctx, text, groq);
       }
     } catch (err) {
       console.error('Groq API Error:', { error: err, text, chatId });
