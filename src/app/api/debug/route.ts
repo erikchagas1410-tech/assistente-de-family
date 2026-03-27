@@ -42,15 +42,17 @@ export async function GET() {
     results.supabase_insert = { error: String(e) };
   }
 
-  // 4. Testa Groq
+  // 4. Testa Groq com o prompt real do classificador
   try {
     const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const today = new Date().toISOString().split('T')[0];
+    const testPrompt = `Classifique a intenção e retorne json. Hoje: ${today}\nMensagem: "gastei 150 reais no bradesco"\njson: {"acao":"conversa","tipo":"none","valor":0,"descricao":"none","data":"hoje","vencimento":"none","categoria":"none","conta":"none","contexto":"CPF","needs_bank":false,"periodo":"none","termo":"none","message":"none"}`;
     const completion = await groq.chat.completions.create({
       model: 'llama-3.1-8b-instant',
-      messages: [{ role: 'user', content: 'Retorne exatamente: {"ok":true}' }],
+      messages: [{ role: 'user', content: testPrompt }],
       response_format: { type: 'json_object' },
-      temperature: 0,
-      max_tokens: 32,
+      temperature: 0.1,
+      max_tokens: 256,
     });
     const text = completion.choices[0]?.message?.content ?? '';
     results.groq = { ok: true, response: text };
