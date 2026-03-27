@@ -497,8 +497,10 @@ const handleMarcarContaPaga = async (ctx: BotCtx, data: NexusResponse) => {
 
 const handleCriarLancamento = async (ctx: BotCtx, data: NexusResponse, originalText: string) => {
   const chatId = ctx.chat!.id;
+  console.log('[handleCriarLancamento] tipo:', data.tipo, 'valor:', data.valor, 'descricao:', data.descricao);
 
   if (data.tipo === 'none' || !data.valor || data.valor <= 0) {
+    console.log('[handleCriarLancamento] skipping: tipo=none or valor<=0');
     await ctx.reply(`Nexus: ${data.message}`);
     return;
   }
@@ -506,6 +508,7 @@ const handleCriarLancamento = async (ctx: BotCtx, data: NexusResponse, originalT
   const inferredBank =
     (isValidBankAccount(data.conta) ? (data.conta as BankAccountId) : null) ||
     findBankFromText(originalText, data.contexto);
+  console.log('[handleCriarLancamento] inferredBank:', inferredBank, 'needs_bank:', data.needs_bank);
 
   if (!inferredBank || data.needs_bank) {
     pendingTransactions.set(chatId, {
@@ -516,6 +519,7 @@ const handleCriarLancamento = async (ctx: BotCtx, data: NexusResponse, originalT
     return;
   }
 
+  console.log('[handleCriarLancamento] inserting to supabase...');
   const { error } = await saveTransaction({
     descricao: data.descricao, valor: data.valor,
     tipo: data.tipo as TransactionType, contexto: data.contexto,
@@ -523,11 +527,12 @@ const handleCriarLancamento = async (ctx: BotCtx, data: NexusResponse, originalT
   });
 
   if (error) {
-    console.error('Supabase Error:', error);
+    console.error('[handleCriarLancamento] Supabase Error:', JSON.stringify(error));
     await ctx.reply('Erro ao salvar a transação. Tente novamente.');
     return;
   }
 
+  console.log('[handleCriarLancamento] saved!');
   await ctx.reply(`Nexus: ${data.message}`);
 };
 
@@ -710,12 +715,15 @@ export const handleTelegramUpdate = async (body: Update) => {
 
   // ── Classify + Dispatch ─────────────────────────────────────────────────────
   try {
+    console.log('[bot] classifying:', text);
     const raw = await generateJSON(groq, getClassifierPrompt(text));
     const cleaned = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
+    console.log('[bot] groq raw:', cleaned.slice(0, 200));
 
     let data: NexusResponse;
     try {
       data = normalizeResponse(JSON.parse(cleaned) as NexusResponse, text);
+      console.log('[bot] normalized acao:', data.acao, 'tipo:', data.tipo, 'valor:', data.valor, 'conta:', data.conta);
     } catch {
       await ctx.reply('Não consegui processar sua solicitação. Tente novamente.');
       return;
