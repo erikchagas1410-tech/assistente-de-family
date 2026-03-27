@@ -2,6 +2,9 @@ import { AlertTriangle, Landmark, TrendingDown, TrendingUp, Wallet, BarChart2, C
 import CategoryChart from '@/components/charts/CategoryChart';
 import TelemetryChart from '@/components/charts/TelemetryChart';
 import AiPanel, { FinancialContext } from '@/components/AiPanel';
+import TransactionComposer from '@/components/dashboard/TransactionComposer';
+import DeleteTransactionButton from '@/components/dashboard/DeleteTransactionButton';
+import AccountBalanceEditor from '@/components/dashboard/AccountBalanceEditor';
 import { BANK_ACCOUNTS, getBankAccountLabel } from '@/lib/banks';
 import { supabase } from '@/lib/supabase/client';
 import { BankAccountId, Bill, Transaction } from '@/types/finance';
@@ -424,6 +427,7 @@ export default async function Home() {
                           />
                         </div>
                       )}
+                      <AccountBalanceEditor accountId={account.id} currentBalance={account.balance} />
                     </div>
                   </div>
                 );
@@ -476,6 +480,7 @@ export default async function Home() {
                           />
                         </div>
                       )}
+                      <AccountBalanceEditor accountId={account.id} currentBalance={account.balance} />
                     </div>
                   </div>
                 );
@@ -485,6 +490,15 @@ export default async function Home() {
 
         {/* ── Transactions ─────────────────────────────────────────────── */}
         <section>
+          <div className="mb-4">
+            <TransactionComposer
+              bankAccounts={BANK_ACCOUNTS.map((account) => ({
+                id: account.id,
+                label: account.label,
+                entity: account.entity,
+              }))}
+            />
+          </div>
           <div className="bg-white/[0.02] border border-white/[0.05] rounded-xl overflow-hidden">
             <div className="flex items-center gap-2.5 px-5 py-4 border-b border-white/[0.04]">
               <span className="w-1.5 h-1.5 rounded-full bg-lime-400 animate-pulse" />
@@ -532,6 +546,7 @@ export default async function Home() {
                         {new Date(item.created_at).toLocaleDateString('pt-BR')}
                       </p>
                     </div>
+                    <DeleteTransactionButton id={item.id} description={item.description} />
                   </div>
                 ))
               )}
