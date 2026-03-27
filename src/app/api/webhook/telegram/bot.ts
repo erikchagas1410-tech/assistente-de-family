@@ -206,6 +206,73 @@ Responda em português, de forma direta e útil. Sem genericidades.
 const normalizeText = (value: string) =>
   value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 
+// Groq às vezes retorna variantes ("despesa", "analisar", etc.) — normaliza para os valores esperados
+const VALID_ACOES: AcaoType[] = [
+  'criar_lancamento', 'editar_lancamento', 'remover_lancamento',
+  'listar_lancamentos', 'buscar_lancamento', 'resumo_periodo',
+  'resumo_por_categoria', 'resumo_por_conta', 'analisar_saude_financeira',
+  'comparar_periodos', 'sugerir_ajustes', 'sugerir_investimentos',
+  'criar_conta_pagar', 'listar_contas_pagar', 'marcar_conta_paga', 'conversa',
+];
+
+const normalizeResponse = (raw: NexusResponse, originalText: string): NexusResponse => {
+  // Normaliza acao
+  let acao = raw.acao as string;
+  if (!VALID_ACOES.includes(acao as AcaoType)) {
+    const a = acao?.toLowerCase() ?? '';
+    if (a.includes('lancamento') || a.includes('criar') || a.includes('registrar')) {
+      acao = 'criar_lancamento';
+    } else if (a.includes('lista') || a.includes('mostra') || a.includes('ver')) {
+      acao = 'listar_lancamentos';
+    } else if (a.includes('resumo') || a.includes('relatorio') || a.includes('relat')) {
+      acao = 'resumo_periodo';
+    } else if (a.includes('saude') || a.includes('saúde') || a.includes('analis')) {
+      acao = 'analisar_saude_financeira';
+    } else if (a.includes('ajust') || a.includes('econom') || a.includes('reduz')) {
+      acao = 'sugerir_ajustes';
+    } else if (a.includes('invest')) {
+      acao = 'sugerir_investimentos';
+    } else if (a.includes('conta') && a.includes('pagar')) {
+      acao = 'criar_conta_pagar';
+    } else {
+      // Último recurso: se tem valor > 0 e tipo de transação, é um lançamento
+      const t = (raw.tipo as string)?.toLowerCase() ?? '';
+      const hasFinancialType = t.includes('expense') || t.includes('income') ||
+        t.includes('despesa') || t.includes('gasto') || t.includes('receita') ||
+        t.includes('entrada') || t.includes('saida') || t.includes('saída');
+      acao = (raw.valor > 0 && hasFinancialType) ? 'criar_lancamento' : 'conversa';
+    }
+  }
+
+  // Normaliza tipo
+  let tipo: TransactionType | 'none' = 'none';
+  const rawTipo = (raw.tipo as string)?.toLowerCase() ?? '';
+  if (['expense', 'despesa', 'gasto', 'saida', 'saída', 'pagamento'].some(v => rawTipo.includes(v))) {
+    tipo = 'expense';
+  } else if (['income', 'receita', 'entrada', 'recebimento', 'ganho'].some(v => rawTipo.includes(v))) {
+    tipo = 'income';
+  } else {
+    tipo = raw.tipo === 'income' || raw.tipo === 'expense' ? raw.tipo : 'none';
+  }
+
+  // Normaliza contexto (entidade CPF/CNPJ)
+  const rawCtx = (raw.contexto as string)?.toUpperCase() ?? '';
+  const contexto: EntityType =
+    rawCtx === 'CNPJ' || rawCtx.includes('CNPJ') || rawCtx.includes('EMPRESA') || rawCtx.includes('PJ')
+      ? 'CNPJ'
+      : 'CPF';
+
+  // Normaliza conta (tenta converter nome livre para ID válido)
+  let conta = raw.conta;
+  if (!isValidBankAccount(conta)) {
+    const foundBank = findBankFromText(String(raw.conta ?? ''), contexto) ??
+      findBankFromText(originalText, contexto);
+    conta = foundBank ?? 'none';
+  }
+
+  return { ...raw, acao: acao as AcaoType, tipo, contexto, conta };
+};
+
 const findBankFromText = (text: string, entity?: EntityType): BankAccountId | null => {
   const normalized = normalizeText(text);
 
@@ -625,7 +692,8 @@ const registerHandlers = (bot: Telegraf, groq: Groq) => {
 
       let data: NexusResponse;
       try {
-        data = JSON.parse(cleaned) as NexusResponse;
+        const parsed = JSON.parse(cleaned) as NexusResponse;
+        data = normalizeResponse(parsed, text);
       } catch (parseError) {
         console.error('JSON Parse Error:', parseError, 'Raw:', cleaned);
         await ctx.reply('Não consegui processar sua solicitação. Tente novamente.');
