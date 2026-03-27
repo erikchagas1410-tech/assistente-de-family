@@ -1,19 +1,7 @@
-import Link from 'next/link';
-import {
-  Badge,
-  Card,
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeaderCell,
-  TableRow,
-  Title,
-} from '@tremor/react';
-import { AlertTriangle, Landmark, Terminal } from 'lucide-react';
+import { AlertTriangle, Landmark, TrendingDown, TrendingUp, Wallet, BarChart2, CalendarDays } from 'lucide-react';
 import CategoryChart from '@/components/charts/CategoryChart';
-import KpiCards from '@/components/charts/KpiCards';
 import TelemetryChart from '@/components/charts/TelemetryChart';
+import AiPanel, { FinancialContext } from '@/components/AiPanel';
 import { BANK_ACCOUNTS, getBankAccountLabel } from '@/lib/banks';
 import { supabase } from '@/lib/supabase/client';
 import { BankAccountId, Transaction } from '@/types/finance';
@@ -21,400 +9,503 @@ import { BankAccountId, Transaction } from '@/types/finance';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-type HomeProps = {
-  searchParams?: {
-    tab?: string;
-  };
-};
-
-const formatCurrency = (value: number) =>
+const fmt = (value: number) =>
   value.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
 
-const tabClassName = (isActive: boolean) =>
-  `px-4 py-2 text-xs font-black uppercase tracking-[0.3em] border transition ${
-    isActive
-      ? 'border-cyan-400 bg-cyan-400/10 text-cyan-300 shadow-[0_0_18px_rgba(34,211,238,0.15)]'
-      : 'border-white/10 text-slate-400 hover:border-cyan-500/40 hover:text-cyan-200'
-  }`;
+// ─── Data ─────────────────────────────────────────────────────────────────────
 
-export default async function Home({ searchParams }: HomeProps) {
-  const activeTab = searchParams?.tab === 'bancos' ? 'bancos' : 'resumo';
-
+export default async function Home() {
   const { data, error } = await supabase
     .from('transactions')
     .select('*')
     .order('created_at', { ascending: false });
 
-  if (error) {
-    console.error('Erro ao buscar dados do Supabase:', error);
-  }
+  if (error) console.error('Supabase error:', error);
 
-  const transactions = (data || []) as Transaction[];
+  const transactions = (data ?? []) as Transaction[];
 
-  let incomeCpf = 0;
-  let expenseCpf = 0;
-  let incomeCnpj = 0;
-  let expenseCnpj = 0;
+  // ── Totals by entity ──────────────────────────────────────────────────────
+  let incomeCpf = 0, expenseCpf = 0, incomeCnpj = 0, expenseCnpj = 0;
 
-  for (const transaction of transactions) {
-    if (transaction.entity === 'CNPJ') {
-      if (transaction.type === 'income') incomeCnpj += Number(transaction.amount);
-      if (transaction.type === 'expense') expenseCnpj += Number(transaction.amount);
-      continue;
+  for (const t of transactions) {
+    const amount = Number(t.amount);
+    if (t.entity === 'CNPJ') {
+      if (t.type === 'income') incomeCnpj += amount;
+      else expenseCnpj += amount;
+    } else {
+      if (t.type === 'income') incomeCpf += amount;
+      else expenseCpf += amount;
     }
-
-    if (transaction.type === 'income') incomeCpf += Number(transaction.amount);
-    if (transaction.type === 'expense') expenseCpf += Number(transaction.amount);
   }
 
-  const balanceCpf = incomeCpf - expenseCpf;
-  const balanceCnpj = incomeCnpj - expenseCnpj;
+  const totalIncome = incomeCpf + incomeCnpj;
+  const totalExpense = expenseCpf + expenseCnpj;
+  const totalBalance = totalIncome - totalExpense;
+  const netResult = totalBalance;
+  const expenseRatio = totalIncome > 0 ? totalExpense / totalIncome : 0;
 
+  // ── Month projection ──────────────────────────────────────────────────────
+  const today = new Date();
+  const daysInMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
+  const dayOfMonth = today.getDate();
+  const dailyBurnRate = dayOfMonth > 0 ? totalExpense / dayOfMonth : 0;
+  const remainingDays = daysInMonth - dayOfMonth;
+  const projectedExpense = totalExpense + dailyBurnRate * remainingDays;
+  const projectedBalance = totalIncome - projectedExpense;
+
+  // ── Health score ──────────────────────────────────────────────────────────
+  let healthScore: number;
+  let healthLabel: string;
+
+  if (totalIncome === 0 && totalExpense === 0) {
+    healthScore = 50;
+    healthLabel = 'Sem dados';
+  } else if (totalIncome === 0) {
+    healthScore = 5;
+    healthLabel = 'Crítico';
+  } else {
+    const raw = Math.round((1 - expenseRatio) * 110); // slight amplification
+    healthScore = Math.min(100, Math.max(0, raw));
+    if (healthScore >= 80) healthLabel = 'Excelente';
+    else if (healthScore >= 60) healthLabel = 'Saudável';
+    else if (healthScore >= 40) healthLabel = 'Atenção';
+    else if (healthScore >= 20) healthLabel = 'Em risco';
+    else healthLabel = 'Crítico';
+  }
+
+  // ── Chart data ────────────────────────────────────────────────────────────
   const chartData = transactions
-    .reduce((acc: { date: string; Entradas: number; Saidas: number }[], transaction) => {
-      const date = new Date(transaction.created_at).toLocaleDateString('pt-BR', {
+    .reduce<{ date: string; Entradas: number; Saidas: number }[]>((acc, t) => {
+      const date = new Date(t.created_at).toLocaleDateString('pt-BR', {
         day: '2-digit',
         month: 'short',
       });
-      const existing = acc.find((item) => item.date === date);
-
-      if (existing) {
-        if (transaction.type === 'income') existing.Entradas += Number(transaction.amount);
-        if (transaction.type === 'expense') existing.Saidas += Number(transaction.amount);
-        return acc;
+      const row = acc.find((r) => r.date === date);
+      const amount = Number(t.amount);
+      if (row) {
+        if (t.type === 'income') row.Entradas += amount;
+        else row.Saidas += amount;
+      } else {
+        acc.push({
+          date,
+          Entradas: t.type === 'income' ? amount : 0,
+          Saidas: t.type === 'expense' ? amount : 0,
+        });
       }
-
-      acc.push({
-        date,
-        Entradas: transaction.type === 'income' ? Number(transaction.amount) : 0,
-        Saidas: transaction.type === 'expense' ? Number(transaction.amount) : 0,
-      });
-
       return acc;
     }, [])
     .reverse();
 
   const expensesByCategory = transactions
-    .filter((transaction) => transaction.type === 'expense')
-    .reduce((acc: { name: string; value: number }[], transaction) => {
-      const categoryName = transaction.description;
-      const existing = acc.find((item) => item.name === categoryName);
-
-      if (existing) {
-        existing.value += Number(transaction.amount);
-        return acc;
-      }
-
-      acc.push({ name: categoryName, value: Number(transaction.amount) });
+    .filter((t) => t.type === 'expense')
+    .reduce<{ name: string; value: number }[]>((acc, t) => {
+      const row = acc.find((r) => r.name === t.description);
+      if (row) row.value += Number(t.amount);
+      else acc.push({ name: t.description, value: Number(t.amount) });
       return acc;
     }, [])
     .sort((a, b) => b.value - a.value)
     .slice(0, 5);
 
-  const totalIncome = incomeCpf + incomeCnpj;
-  const totalExpense = expenseCpf + expenseCnpj;
-  const isCritical = totalIncome > 0 && totalExpense / totalIncome > 0.85;
-
+  // ── Bank summaries ────────────────────────────────────────────────────────
   const bankSummaries = BANK_ACCOUNTS.map((account) => {
-    const accountTransactions = transactions.filter(
-      (transaction) => transaction.bank_account === account.id,
-    );
-
-    const income = accountTransactions
-      .filter((transaction) => transaction.type === 'income')
-      .reduce((sum, transaction) => sum + Number(transaction.amount), 0);
-
-    const expense = accountTransactions
-      .filter((transaction) => transaction.type === 'expense')
-      .reduce((sum, transaction) => sum + Number(transaction.amount), 0);
-
-    return {
-      ...account,
-      income,
-      expense,
-      balance: income - expense,
-      count: accountTransactions.length,
-    };
+    const txs = transactions.filter((t) => t.bank_account === account.id);
+    const income = txs.filter((t) => t.type === 'income').reduce((s, t) => s + Number(t.amount), 0);
+    const expense = txs.filter((t) => t.type === 'expense').reduce((s, t) => s + Number(t.amount), 0);
+    return { ...account, income, expense, balance: income - expense, count: txs.length };
   });
 
-  const pfBanks = bankSummaries.filter((account) => account.entity === 'CPF');
-  const pjBanks = bankSummaries.filter((account) => account.entity === 'CNPJ');
-  const unassignedTransactions = transactions.filter((transaction) => !transaction.bank_account);
+  const unassigned = transactions.filter((t) => !t.bank_account).length;
+
+  // ── AI Insights ───────────────────────────────────────────────────────────
+  const insights: string[] = [];
+
+  if (expenseRatio > 0.85) {
+    insights.push(`Despesas em ${Math.round(expenseRatio * 100)}% das entradas — risco de déficit.`);
+  } else if (expenseRatio > 0.65) {
+    insights.push(`${Math.round(expenseRatio * 100)}% das entradas já comprometidas com gastos.`);
+  }
+  if (expensesByCategory[0]) {
+    insights.push(`"${expensesByCategory[0].name}" lidera os gastos: ${fmt(expensesByCategory[0].value)}.`);
+  }
+  const bestBank = [...bankSummaries].sort((a, b) => b.balance - a.balance)[0];
+  if (bestBank?.balance > 0) {
+    insights.push(`${bestBank.label} tem o melhor saldo: ${fmt(bestBank.balance)}.`);
+  }
+  if (projectedBalance < 0) {
+    insights.push(`Projeção indica déficit de ${fmt(Math.abs(projectedBalance))} ao fechar o mês.`);
+  }
+
+  // ── AI Alert ─────────────────────────────────────────────────────────────
+  let aiAlert: string | null = null;
+  if (expenseRatio > 0.85) {
+    aiAlert = `Despesas em ${Math.round(expenseRatio * 100)}% das suas entradas. Risco real de déficit no fim do período.`;
+  } else if (projectedBalance < 0) {
+    aiAlert = `Projeção indica déficit de ${fmt(Math.abs(projectedBalance))} no ritmo atual de gastos.`;
+  } else if (expenseRatio > 0.7 && expensesByCategory[0]) {
+    aiAlert = `"${expensesByCategory[0].name}" representa ${Math.round((expensesByCategory[0].value / totalExpense) * 100)}% das suas despesas. Vale revisar.`;
+  }
+
+  // ── Financial context for AI panel ───────────────────────────────────────
+  const financialContext: FinancialContext = {
+    totalBalance,
+    totalIncome,
+    totalExpense,
+    netResult,
+    projectedBalance,
+    healthScore,
+    healthLabel,
+    expenseRatio,
+  };
+
+  const dateStr = today.toLocaleDateString('pt-BR', {
+    weekday: 'short',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+  });
+
+  // ─── Render ───────────────────────────────────────────────────────────────
 
   return (
-    <main className="max-w-[1400px] mx-auto space-y-8 p-4 md:p-8">
-      <div className="flex flex-col gap-6 border-b border-white/5 pb-6 md:flex-row md:items-center md:justify-between">
-        <div>
-          <h1 className="bg-gradient-to-r from-cyan-400 via-purple-500 to-fuchsia-500 bg-clip-text text-5xl font-black tracking-tighter text-transparent drop-shadow-[0_0_15px_rgba(0,240,255,0.4)]">
-            NEXUS CHROME
-          </h1>
-          <p className="mt-2 flex items-center gap-2 text-xs font-bold uppercase tracking-[0.3em] text-yellow-400/80">
-            <Terminal className="h-4 w-4" /> Constructo Financeiro Ativo
-          </p>
-        </div>
+    <div className="min-h-screen bg-[#050505]">
+      {/* Background: faint grid + radial glow */}
+      <div
+        className="fixed inset-0 pointer-events-none"
+        style={{
+          backgroundImage:
+            'linear-gradient(rgba(255,255,255,0.012) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.012) 1px, transparent 1px)',
+          backgroundSize: '52px 52px',
+        }}
+      />
+      <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_20%_20%,rgba(132,204,22,0.04)_0%,transparent_55%)]" />
 
-        <div className="flex flex-col items-start gap-4 md:items-end">
-          <div className="flex items-center gap-3 rounded-none border border-cyan-500/40 bg-black/60 px-4 py-2 shadow-[0_0_15px_rgba(0,240,255,0.2)] backdrop-blur-md">
-            <span className="relative flex h-3 w-3">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-sm bg-cyan-400 opacity-75"></span>
-              <span className="relative inline-flex h-3 w-3 rounded-sm bg-cyan-500 shadow-[0_0_8px_rgba(0,240,255,1)]"></span>
-            </span>
-            <span className="text-xs font-bold uppercase tracking-widest text-cyan-400">
-              Uplink Estabelecido
-            </span>
-          </div>
+      {/* Layout: main + fixed right panel */}
+      <main className="lg:mr-[360px] px-5 py-7 lg:px-8 lg:py-8 space-y-6 relative z-10">
 
-          <div className="flex gap-2">
-            <Link href="/" className={tabClassName(activeTab === 'resumo')}>
-              Resumo
-            </Link>
-            <Link href="/?tab=bancos" className={tabClassName(activeTab === 'bancos')}>
-              Bancos
-            </Link>
-          </div>
-        </div>
-      </div>
-
-      {isCritical && (
-        <div className="relative flex items-start gap-4 overflow-hidden rounded-none border border-fuchsia-500/50 bg-fuchsia-950/40 p-6 shadow-[0_0_30px_rgba(217,70,239,0.3)] backdrop-blur-md">
-          <div className="absolute left-0 top-0 h-full w-1 bg-fuchsia-500 shadow-[0_0_15px_rgba(217,70,239,1)]"></div>
-          <AlertTriangle className="h-8 w-8 flex-shrink-0 animate-pulse text-fuchsia-500 drop-shadow-[0_0_10px_rgba(217,70,239,0.8)]" />
+        {/* ── Header ──────────────────────────────────────────────────── */}
+        <header className="flex items-start justify-between gap-4">
           <div>
-            <h3 className="text-lg font-black uppercase tracking-widest text-fuchsia-500 drop-shadow-[0_0_8px_rgba(217,70,239,0.8)]">
-              Aviso: Sobrecarga de Sistema
-            </h3>
-            <p className="mt-1 text-sm font-medium tracking-wide text-fuchsia-300/80">
-              As despesas superaram 85% das entradas totais. Vale revisar os lancamentos
-              mais pesados antes de fechar o periodo.
+            <h1 className="text-4xl font-black tracking-tight text-white leading-none">
+              NEXUS
+              <span className="text-lime-400">.</span>
+            </h1>
+            <p className="mt-1.5 text-[10px] font-bold uppercase tracking-[0.35em] text-white/30">
+              Constructo Financeiro Ativo
             </p>
           </div>
-        </div>
-      )}
 
-      {activeTab === 'resumo' ? (
-        <>
-          <div className="grid grid-cols-1 gap-8 xl:grid-cols-2">
-            <div className="space-y-4">
-              <h2 className="flex items-center gap-2 border-b border-cyan-500/20 pb-2 text-sm font-black uppercase tracking-[0.3em] text-cyan-500/80">
-                <span className="h-2 w-2 rounded-sm bg-cyan-500/80 shadow-[0_0_5px_rgba(0,240,255,0.8)]"></span>
-                Patrimonio Fisico (CPF)
-              </h2>
-              <KpiCards balance={balanceCpf} income={incomeCpf} expense={expenseCpf} />
+          <div className="flex items-center gap-3 mt-1">
+            <div className="flex items-center gap-2 text-[10px] text-white/30 uppercase tracking-widest">
+              <CalendarDays className="w-3.5 h-3.5" />
+              {dateStr}
             </div>
-
-            <div className="space-y-4">
-              <h2 className="flex items-center gap-2 border-b border-purple-500/20 pb-2 text-sm font-black uppercase tracking-[0.3em] text-purple-400/80">
-                <span className="h-2 w-2 rounded-sm bg-purple-500/80 shadow-[0_0_5px_rgba(168,85,247,0.8)]"></span>
-                Caixa Corporativo (CNPJ)
-              </h2>
-              <KpiCards balance={balanceCnpj} income={incomeCnpj} expense={expenseCnpj} />
+            <div className="flex items-center gap-2 px-3 py-1.5 border border-lime-500/20 rounded-full bg-lime-500/[0.04]">
+              <span className="relative flex h-1.5 w-1.5">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-lime-400 opacity-60" />
+                <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-lime-400" />
+              </span>
+              <span className="text-[10px] font-bold uppercase tracking-[0.25em] text-lime-400">
+                Live
+              </span>
             </div>
           </div>
+        </header>
 
-          <div className="mt-8 grid grid-cols-1 gap-8 lg:grid-cols-3">
-            <div className="lg:col-span-2">
-              <TelemetryChart chartData={chartData} />
-            </div>
-            <div className="lg:col-span-1">
-              <CategoryChart data={expensesByCategory} />
-            </div>
-          </div>
-        </>
-      ) : (
-        <div className="space-y-8">
-          <div className="grid grid-cols-1 gap-8 xl:grid-cols-2">
-            <Card className="rounded-none border border-cyan-500/20 border-l-4 border-l-cyan-400 bg-black/60 shadow-[0_0_20px_rgba(34,211,238,0.08)] ring-0 backdrop-blur-md">
-              <Title className="mb-5 flex items-center gap-3 border-b border-cyan-500/20 pb-4 text-sm font-bold uppercase tracking-widest text-cyan-100">
-                <Landmark className="h-4 w-4 text-cyan-400" />
-                Bancos PF
-              </Title>
-
-              <div className="space-y-4">
-                {pfBanks.map((account) => (
-                  <div
-                    key={account.id}
-                    className="border border-cyan-500/10 bg-cyan-500/5 p-4 shadow-[0_0_18px_rgba(34,211,238,0.04)]"
-                  >
-                    <div className="flex items-center justify-between gap-3">
-                      <div>
-                        <p className="text-sm font-black uppercase tracking-[0.2em] text-cyan-200">
-                          {account.label}
-                        </p>
-                        <p className="mt-1 text-xs uppercase tracking-[0.25em] text-slate-500">
-                          {account.count} lancamentos
-                        </p>
-                      </div>
-                      <Badge color="cyan" className="rounded-none border border-current text-[10px] font-bold uppercase tracking-wider">
-                        {account.bank}
-                      </Badge>
-                    </div>
-
-                    <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
-                      <div>
-                        <p className="text-[10px] font-bold uppercase tracking-[0.3em] text-slate-500">
-                          Entradas
-                        </p>
-                        <p className="mt-1 text-lg font-semibold text-emerald-300">
-                          {formatCurrency(account.income)}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-[10px] font-bold uppercase tracking-[0.3em] text-slate-500">
-                          Saidas
-                        </p>
-                        <p className="mt-1 text-lg font-semibold text-rose-300">
-                          {formatCurrency(account.expense)}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-[10px] font-bold uppercase tracking-[0.3em] text-slate-500">
-                          Saldo
-                        </p>
-                        <p className="mt-1 text-lg font-semibold text-cyan-100">
-                          {formatCurrency(account.balance)}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </Card>
-
-            <Card className="rounded-none border border-purple-500/20 border-l-4 border-l-purple-400 bg-black/60 shadow-[0_0_20px_rgba(168,85,247,0.08)] ring-0 backdrop-blur-md">
-              <Title className="mb-5 flex items-center gap-3 border-b border-purple-500/20 pb-4 text-sm font-bold uppercase tracking-widest text-purple-100">
-                <Landmark className="h-4 w-4 text-purple-400" />
-                Bancos PJ
-              </Title>
-
-              <div className="space-y-4">
-                {pjBanks.map((account) => (
-                  <div
-                    key={account.id}
-                    className="border border-purple-500/10 bg-purple-500/5 p-4 shadow-[0_0_18px_rgba(168,85,247,0.04)]"
-                  >
-                    <div className="flex items-center justify-between gap-3">
-                      <div>
-                        <p className="text-sm font-black uppercase tracking-[0.2em] text-purple-200">
-                          {account.label}
-                        </p>
-                        <p className="mt-1 text-xs uppercase tracking-[0.25em] text-slate-500">
-                          {account.count} lancamentos
-                        </p>
-                      </div>
-                      <Badge color="violet" className="rounded-none border border-current text-[10px] font-bold uppercase tracking-wider">
-                        {account.bank}
-                      </Badge>
-                    </div>
-
-                    <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
-                      <div>
-                        <p className="text-[10px] font-bold uppercase tracking-[0.3em] text-slate-500">
-                          Entradas
-                        </p>
-                        <p className="mt-1 text-lg font-semibold text-emerald-300">
-                          {formatCurrency(account.income)}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-[10px] font-bold uppercase tracking-[0.3em] text-slate-500">
-                          Saidas
-                        </p>
-                        <p className="mt-1 text-lg font-semibold text-rose-300">
-                          {formatCurrency(account.expense)}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-[10px] font-bold uppercase tracking-[0.3em] text-slate-500">
-                          Saldo
-                        </p>
-                        <p className="mt-1 text-lg font-semibold text-purple-100">
-                          {formatCurrency(account.balance)}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </Card>
-          </div>
-
-          {unassignedTransactions.length > 0 && (
-            <Card className="rounded-none border border-amber-500/20 border-l-4 border-l-amber-400 bg-black/60 ring-0 backdrop-blur-md">
-              <Title className="mb-2 text-sm font-bold uppercase tracking-widest text-amber-100">
-                Lancamentos sem banco
-              </Title>
-              <p className="text-sm text-amber-200/80">
-                {unassignedTransactions.length} transacao(oes) ainda nao tem banco vinculado.
-                Os novos lancamentos pelo Telegram agora vao exigir esse dado antes de salvar.
+        {/* ── KPI Hero Cards (5) ──────────────────────────────────────── */}
+        <section className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+          {/* Total Balance */}
+          <div className="col-span-2 sm:col-span-3 lg:col-span-1 bg-white/[0.03] border border-lime-500/15 rounded-xl p-4 hover:border-lime-500/30 transition-all">
+            <div className="flex items-center gap-1.5 mb-3">
+              <Wallet className="w-3.5 h-3.5 text-lime-400/70" />
+              <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-white/30">
+                Saldo Total
               </p>
-            </Card>
-          )}
-        </div>
-      )}
+            </div>
+            <p
+              className="text-2xl font-black text-lime-400 tabular-nums"
+              style={{ textShadow: '0 0 20px rgba(163,230,53,0.3)' }}
+            >
+              {fmt(totalBalance)}
+            </p>
+            <p className="text-[10px] text-white/20 mt-1.5">CPF + CNPJ consolidado</p>
+          </div>
 
-      <Card className="mt-8 rounded-none border border-fuchsia-500/20 border-l-4 border-l-fuchsia-500 bg-black/60 shadow-[0_0_20px_rgba(217,70,239,0.05)] ring-0 backdrop-blur-md">
-        <Title className="flex items-center gap-3 border-b border-fuchsia-500/20 pb-4 text-sm font-bold uppercase tracking-widest text-fuchsia-100">
-          <span className="relative flex h-2 w-2">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-sm bg-fuchsia-400 opacity-75"></span>
-            <span className="relative inline-flex h-2 w-2 rounded-sm bg-fuchsia-500 shadow-[0_0_5px_rgba(217,70,239,1)]"></span>
-          </span>
-          Registro Neural de Transacoes
-        </Title>
+          {/* Monthly Income */}
+          <div className="bg-white/[0.02] border border-white/[0.05] rounded-xl p-4 hover:border-emerald-500/20 transition-all">
+            <div className="flex items-center gap-1.5 mb-3">
+              <TrendingUp className="w-3.5 h-3.5 text-emerald-400/70" />
+              <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-white/30">
+                Entradas
+              </p>
+            </div>
+            <p className="text-xl font-black text-emerald-400 tabular-nums">{fmt(totalIncome)}</p>
+            <p className="text-[10px] text-white/20 mt-1.5">Receitas totais</p>
+          </div>
 
-        <Table className="mt-5">
-          <TableHead>
-            <TableRow>
-              <TableHeaderCell className="text-slate-400">Descricao</TableHeaderCell>
-              <TableHeaderCell className="text-slate-400">Valor</TableHeaderCell>
-              <TableHeaderCell className="text-slate-400">Entidade</TableHeaderCell>
-              <TableHeaderCell className="text-slate-400">Banco</TableHeaderCell>
-              <TableHeaderCell className="text-slate-400">Tipo</TableHeaderCell>
-              <TableHeaderCell className="text-slate-400">Data</TableHeaderCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {transactions.map((item) => (
-              <TableRow key={item.id}>
-                <TableCell className="text-slate-300">{item.description}</TableCell>
-                <TableCell className="text-slate-300">
-                  {formatCurrency(Number(item.amount))}
-                </TableCell>
-                <TableCell>
-                  <Badge
-                    color={item.entity === 'CNPJ' ? 'violet' : 'cyan'}
-                    className="rounded-none border border-current text-[10px] font-bold uppercase tracking-wider"
+          {/* Monthly Expenses */}
+          <div className="bg-white/[0.02] border border-white/[0.05] rounded-xl p-4 hover:border-rose-500/20 transition-all">
+            <div className="flex items-center gap-1.5 mb-3">
+              <TrendingDown className="w-3.5 h-3.5 text-rose-400/70" />
+              <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-white/30">
+                Saídas
+              </p>
+            </div>
+            <p className="text-xl font-black text-rose-400 tabular-nums">{fmt(totalExpense)}</p>
+            <p className="text-[10px] text-white/20 mt-1.5">
+              {totalIncome > 0 ? `${Math.round(expenseRatio * 100)}% das entradas` : 'Sem entradas'}
+            </p>
+          </div>
+
+          {/* Net Result */}
+          <div className="bg-white/[0.02] border border-white/[0.05] rounded-xl p-4 hover:border-white/10 transition-all">
+            <div className="flex items-center gap-1.5 mb-3">
+              <BarChart2 className="w-3.5 h-3.5 text-white/30" />
+              <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-white/30">
+                Resultado
+              </p>
+            </div>
+            <p
+              className={`text-xl font-black tabular-nums ${
+                netResult >= 0 ? 'text-lime-400' : 'text-rose-400'
+              }`}
+            >
+              {netResult >= 0 ? '+' : ''}
+              {fmt(netResult)}
+            </p>
+            <p className="text-[10px] text-white/20 mt-1.5">Líquido do período</p>
+          </div>
+
+          {/* Projection */}
+          <div
+            className={`bg-white/[0.02] border rounded-xl p-4 transition-all ${
+              projectedBalance < 0
+                ? 'border-amber-500/20 hover:border-amber-500/35'
+                : 'border-white/[0.05] hover:border-white/10'
+            }`}
+          >
+            <div className="flex items-center gap-1.5 mb-3">
+              <CalendarDays
+                className={`w-3.5 h-3.5 ${projectedBalance < 0 ? 'text-amber-400/70' : 'text-white/30'}`}
+              />
+              <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-white/30">
+                Projeção
+              </p>
+            </div>
+            <p
+              className={`text-xl font-black tabular-nums ${
+                projectedBalance < 0 ? 'text-amber-400' : 'text-white/70'
+              }`}
+            >
+              {fmt(projectedBalance)}
+            </p>
+            <p className="text-[10px] text-white/20 mt-1.5">Estimativa fim do mês</p>
+          </div>
+        </section>
+
+        {/* ── AI Alert ────────────────────────────────────────────────── */}
+        {aiAlert && (
+          <div className="relative flex items-start gap-4 rounded-xl border border-amber-500/25 bg-amber-950/20 px-5 py-4 overflow-hidden">
+            <div className="absolute inset-0 bg-gradient-to-r from-amber-500/[0.06] to-transparent pointer-events-none" />
+            <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-amber-400" style={{ boxShadow: '0 0 8px rgba(251,191,36,0.8)' }} />
+            <AlertTriangle className="h-5 w-5 flex-shrink-0 text-amber-400 mt-0.5" style={{ filter: 'drop-shadow(0 0 6px rgba(251,191,36,0.7))' }} />
+            <div>
+              <p className="text-[10px] font-black uppercase tracking-[0.3em] text-amber-400 mb-1">
+                Alerta Nexus AI
+              </p>
+              <p className="text-sm text-amber-200/70 leading-relaxed">{aiAlert}</p>
+            </div>
+          </div>
+        )}
+
+        {/* ── Charts ──────────────────────────────────────────────────── */}
+        <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="lg:col-span-2">
+            <TelemetryChart chartData={chartData} />
+          </div>
+          <div className="lg:col-span-1">
+            <CategoryChart data={expensesByCategory} />
+          </div>
+        </section>
+
+        {/* ── Bank Accounts ────────────────────────────────────────────── */}
+        <section>
+          <div className="flex items-center gap-2 mb-4">
+            <Landmark className="w-4 h-4 text-white/25" />
+            <p className="text-[11px] font-bold uppercase tracking-[0.25em] text-white/25">
+              Contas Bancárias
+            </p>
+            {unassigned > 0 && (
+              <span className="ml-auto text-[10px] text-amber-400/70 border border-amber-500/20 rounded-full px-2 py-0.5">
+                {unassigned} sem banco
+              </span>
+            )}
+          </div>
+
+          {/* PF Banks */}
+          <p className="text-[10px] uppercase tracking-[0.2em] text-white/20 mb-2">Pessoa Física</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 mb-4">
+            {bankSummaries
+              .filter((a) => a.entity === 'CPF')
+              .map((account) => {
+                const ratio = account.income > 0 ? account.expense / account.income : 0;
+                const barPct = Math.min(100, Math.round(ratio * 100));
+                const barColor =
+                  barPct > 85 ? 'bg-rose-500' : barPct > 70 ? 'bg-amber-400' : 'bg-lime-400';
+                return (
+                  <div
+                    key={account.id}
+                    className="bg-white/[0.02] border border-white/[0.05] rounded-xl p-4 hover:border-lime-500/15 transition-all"
                   >
-                    {item.entity || 'CPF'}
-                  </Badge>
-                </TableCell>
-                <TableCell className="text-slate-300">
-                  {item.bank_account ? (
-                    <Badge
-                      color="gray"
-                      className="rounded-none border border-current text-[10px] font-bold uppercase tracking-wider"
+                    <div className="flex items-start justify-between mb-3">
+                      <div>
+                        <p className="text-sm font-bold text-white/80">{account.bank}</p>
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-lime-400/70 bg-lime-500/[0.08] border border-lime-500/15 rounded px-1.5 py-0.5 mt-1 inline-block">
+                          CPF
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-white/25">{account.count} tx</p>
+                    </div>
+                    <p
+                      className={`text-xl font-black tabular-nums mb-3 ${
+                        account.balance >= 0 ? 'text-white/90' : 'text-rose-400'
+                      }`}
                     >
-                      {getBankAccountLabel(item.bank_account as BankAccountId)}
-                    </Badge>
-                  ) : (
-                    <span className="text-amber-300">Nao informado</span>
-                  )}
-                </TableCell>
-                <TableCell>
-                  <Badge
-                    color={item.type === 'income' ? 'emerald' : 'fuchsia'}
-                    className="rounded-none border border-current text-[10px] font-bold uppercase tracking-wider"
+                      {fmt(account.balance)}
+                    </p>
+                    <div className="space-y-2">
+                      <div className="flex justify-between text-[10px] text-white/25">
+                        <span className="text-emerald-400/60">↑ {fmt(account.income)}</span>
+                        <span className="text-rose-400/60">↓ {fmt(account.expense)}</span>
+                      </div>
+                      {account.income > 0 && (
+                        <div className="h-0.5 bg-white/[0.05] rounded-full overflow-hidden">
+                          <div
+                            className={`h-full ${barColor} rounded-full`}
+                            style={{ width: `${barPct}%` }}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+          </div>
+
+          {/* PJ Banks */}
+          <p className="text-[10px] uppercase tracking-[0.2em] text-white/20 mb-2">
+            Pessoa Jurídica
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {bankSummaries
+              .filter((a) => a.entity === 'CNPJ')
+              .map((account) => {
+                const ratio = account.income > 0 ? account.expense / account.income : 0;
+                const barPct = Math.min(100, Math.round(ratio * 100));
+                const barColor =
+                  barPct > 85 ? 'bg-rose-500' : barPct > 70 ? 'bg-amber-400' : 'bg-violet-400';
+                return (
+                  <div
+                    key={account.id}
+                    className="bg-white/[0.02] border border-white/[0.05] rounded-xl p-4 hover:border-violet-500/15 transition-all"
                   >
-                    {item.type === 'income' ? 'Entrada' : 'Saida'}
-                  </Badge>
-                </TableCell>
-                <TableCell className="text-slate-300">
-                  {new Date(item.created_at).toLocaleDateString('pt-BR')}
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      </Card>
-    </main>
+                    <div className="flex items-start justify-between mb-3">
+                      <div>
+                        <p className="text-sm font-bold text-white/80">{account.bank}</p>
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-violet-400/70 bg-violet-500/[0.08] border border-violet-500/15 rounded px-1.5 py-0.5 mt-1 inline-block">
+                          CNPJ
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-white/25">{account.count} tx</p>
+                    </div>
+                    <p
+                      className={`text-xl font-black tabular-nums mb-3 ${
+                        account.balance >= 0 ? 'text-white/90' : 'text-rose-400'
+                      }`}
+                    >
+                      {fmt(account.balance)}
+                    </p>
+                    <div className="space-y-2">
+                      <div className="flex justify-between text-[10px] text-white/25">
+                        <span className="text-emerald-400/60">↑ {fmt(account.income)}</span>
+                        <span className="text-rose-400/60">↓ {fmt(account.expense)}</span>
+                      </div>
+                      {account.income > 0 && (
+                        <div className="h-0.5 bg-white/[0.05] rounded-full overflow-hidden">
+                          <div
+                            className={`h-full ${barColor} rounded-full`}
+                            style={{ width: `${barPct}%` }}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+          </div>
+        </section>
+
+        {/* ── Transactions ─────────────────────────────────────────────── */}
+        <section>
+          <div className="bg-white/[0.02] border border-white/[0.05] rounded-xl overflow-hidden">
+            <div className="flex items-center gap-2.5 px-5 py-4 border-b border-white/[0.04]">
+              <span className="w-1.5 h-1.5 rounded-full bg-lime-400 animate-pulse" />
+              <p className="text-[11px] font-bold uppercase tracking-[0.25em] text-white/30">
+                Transações Recentes
+              </p>
+              <span className="ml-auto text-[10px] text-white/20">
+                {transactions.length} registros
+              </span>
+            </div>
+
+            <div className="divide-y divide-white/[0.03]">
+              {transactions.length === 0 ? (
+                <p className="px-5 py-8 text-sm text-white/20 text-center">
+                  Nenhuma transação registrada.
+                </p>
+              ) : (
+                transactions.slice(0, 20).map((item) => (
+                  <div
+                    key={item.id}
+                    className="flex items-center gap-4 px-5 py-3 hover:bg-white/[0.015] transition-colors"
+                  >
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                        item.type === 'income' ? 'bg-emerald-400' : 'bg-rose-400'
+                      }`}
+                    />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm text-white/70 truncate">{item.description}</p>
+                      <p className="text-[10px] text-white/25 mt-0.5">
+                        {getBankAccountLabel(item.bank_account as BankAccountId)} ·{' '}
+                        {item.entity ?? 'CPF'}
+                      </p>
+                    </div>
+                    <div className="text-right flex-shrink-0">
+                      <p
+                        className={`text-sm font-semibold tabular-nums ${
+                          item.type === 'income' ? 'text-emerald-400' : 'text-rose-400'
+                        }`}
+                      >
+                        {item.type === 'income' ? '+' : '-'}
+                        {fmt(Number(item.amount))}
+                      </p>
+                      <p className="text-[10px] text-white/20 mt-0.5">
+                        {new Date(item.created_at).toLocaleDateString('pt-BR')}
+                      </p>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </section>
+      </main>
+
+      {/* ── AI Copilot Panel (fixed right) ──────────────────────────── */}
+      <aside className="hidden lg:flex fixed right-0 top-0 w-[360px] h-screen flex-col z-20">
+        <AiPanel context={financialContext} insights={insights} />
+      </aside>
+    </div>
   );
 }

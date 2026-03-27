@@ -1,33 +1,35 @@
-"use client";
+'use client';
 
-import { AreaChart, Card, Title } from "@tremor/react";
-import { Activity } from "lucide-react";
+import { AreaChart } from '@tremor/react';
+import { Activity } from 'lucide-react';
 
 interface TelemetryChartProps {
-  chartData: any[];
+  chartData: { date: string; Entradas: number; Saidas: number }[];
 }
 
 export default function TelemetryChart({ chartData }: TelemetryChartProps) {
   return (
-    <Card className="backdrop-blur-md bg-opacity-70 bg-black/60 border border-cyan-500/20 shadow-[0_0_20px_rgba(0,240,255,0.05)] ring-0 rounded-none border-l-4 border-l-cyan-500 h-full">
-      <div className="mb-6 flex items-center gap-3 border-b border-cyan-500/20 pb-4">
-        <Activity className="h-5 w-5 text-cyan-400 drop-shadow-[0_0_5px_rgba(0,240,255,0.8)]" />
-        <Title className="text-sm font-bold uppercase tracking-widest text-cyan-100 drop-shadow-[0_0_5px_rgba(0,240,255,0.4)]">
-          Scanner Neural de Fluxo Financeiro
-        </Title>
+    <div className="bg-white/[0.02] border border-white/[0.05] rounded-xl p-5 h-full">
+      <div className="flex items-center gap-2.5 mb-5">
+        <Activity className="h-4 w-4 text-lime-400" />
+        <p className="text-[11px] font-bold uppercase tracking-[0.25em] text-white/50">
+          Fluxo de Caixa
+        </p>
       </div>
       <AreaChart
-        className="mt-4 h-80"
+        className="h-64"
         data={chartData}
         index="date"
-        categories={["Entradas", "Saidas"]}
-        colors={["yellow", "fuchsia"]}
-        valueFormatter={(number) => `R$ ${number.toFixed(2)}`}
-        showLegend={true}
+        categories={['Entradas', 'Saidas']}
+        colors={['emerald', 'rose']}
+        valueFormatter={(n) =>
+          n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })
+        }
+        showLegend
         showGridLines={false}
-        showAnimation={true}
+        showAnimation
         curveType="monotone"
       />
-    </Card>
+    </div>
   );
 }
