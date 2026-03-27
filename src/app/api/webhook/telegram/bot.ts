@@ -85,7 +85,7 @@ let runtime: TelegramRuntime | null = null;
 
 // ─── Groq Helpers ─────────────────────────────────────────────────────────────
 
-const CLASSIFIER_MODEL = 'llama3-8b-8192';   // 14.400 RPD free — JSON mode
+const CLASSIFIER_MODEL = 'llama-3.1-8b-instant'; // substituto do llama3-8b-8192 — JSON mode
 const ANALYSIS_MODEL   = 'llama-3.3-70b-versatile'; // melhor raciocínio — texto livre
 
 const generateJSON = async (groq: Groq, prompt: string): Promise<string> => {
