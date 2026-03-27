@@ -609,12 +609,12 @@ const getTelegramRuntime = (): TelegramRuntime => {
   const genAI = new GoogleGenerativeAI(geminiApiKey);
 
   const classifierModel = genAI.getGenerativeModel({
-    model: 'gemini-2.0-flash',
+    model: 'gemini-1.5-flash-8b',
     generationConfig: { responseMimeType: 'application/json' },
   });
 
   const analysisModel = genAI.getGenerativeModel({
-    model: 'gemini-2.0-flash',
+    model: 'gemini-1.5-flash-8b',
   });
 
   registerHandlers(bot, classifierModel, analysisModel);
