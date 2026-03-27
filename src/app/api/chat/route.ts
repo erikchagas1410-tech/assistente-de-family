@@ -11,7 +11,7 @@ export async function POST(req: NextRequest) {
     }
 
     const genAI = new GoogleGenerativeAI(geminiApiKey);
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash-8b' });
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
 
     const prompt = `Você é o Nexus Wealth, Assistente Financeiro com comportamento humano.
 Tom: direto, inteligente, confiável, sem enrolação. Responda em no máximo 120 palavras.

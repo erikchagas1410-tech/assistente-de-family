@@ -269,11 +269,11 @@ const getGeminiUserMessage = (error: unknown) => {
     message.includes('resource has been exhausted') ||
     message.includes('429')
   ) {
-    return `Cota do Gemini esgotada. Aguarde e tente novamente.\n\n_Detalhe: ${raw.slice(0, 120)}_`;
+    return `Cota do Gemini esgotada. Aguarde e tente novamente.\n\n_Detalhe: ${raw.slice(0, 220)}_`;
   }
 
   if (message.includes('not found') || message.includes('404')) {
-    return `Modelo de IA não encontrado. Verifique o nome do modelo na configuração.\n\n_Detalhe: ${raw.slice(0, 120)}_`;
+    return `Modelo de IA não encontrado. Verifique o nome do modelo na configuração.\n\n_Detalhe: ${raw.slice(0, 220)}_`;
   }
 
   if (message.includes('fetch failed') || message.includes('econnrefused') || message.includes('etimedout')) {
@@ -609,12 +609,12 @@ const getTelegramRuntime = (): TelegramRuntime => {
   const genAI = new GoogleGenerativeAI(geminiApiKey);
 
   const classifierModel = genAI.getGenerativeModel({
-    model: 'gemini-1.5-flash-8b',
+    model: 'gemini-2.0-flash-exp',
     generationConfig: { responseMimeType: 'application/json' },
   });
 
   const analysisModel = genAI.getGenerativeModel({
-    model: 'gemini-1.5-flash-8b',
+    model: 'gemini-2.0-flash-exp',
   });
 
   registerHandlers(bot, classifierModel, analysisModel);
