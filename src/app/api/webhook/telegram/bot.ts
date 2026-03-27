@@ -76,16 +76,11 @@ interface AnalysisData {
   porContexto: Record<string, { entradas: number; saidas: number; saldo: number }>;
 }
 
-interface PendingBillCreation {
-  descricao: string;
-  valor: number;
-  entity: EntityType;
-}
+
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
 const pendingTransactions  = new Map<number, PendingTransaction>();
-const pendingBillCreations = new Map<number, PendingBillCreation>();
 
 interface HistoryMessage { role: 'user' | 'assistant'; content: string }
 const conversationHistory = new Map<number, HistoryMessage[]>();
@@ -317,14 +312,14 @@ const getErrorMessage = (error: unknown) => {
 
 // ─── Supabase ─────────────────────────────────────────────────────────────────
 
-const saveTransaction = async (transaction: PendingTransaction & { bank_account: BankAccountId }) => {
-  const account = BANK_ACCOUNT_BY_ID[transaction.bank_account];
+const saveTransaction = async (transaction: PendingTransaction & { bank_account?: BankAccountId | null }) => {
+  const account = transaction.bank_account ? BANK_ACCOUNT_BY_ID[transaction.bank_account] : null;
   return supabase.from('transactions').insert([{
     description: transaction.descricao,
     amount: transaction.valor,
     type: transaction.tipo,
-    entity: account.entity,
-    bank_account: transaction.bank_account,
+    entity: account?.entity ?? transaction.contexto,
+    bank_account: transaction.bank_account ?? null,
   }]);
 };
 
@@ -400,7 +395,6 @@ const saveBill = async (bill: { descricao: string; valor: number; due_date: stri
 // ─── Action Handlers ──────────────────────────────────────────────────────────
 
 const handleCriarContaPagar = async (ctx: BotCtx, data: NexusResponse) => {
-  const chatId = ctx.chat!.id;
 
   if (!data.descricao || data.descricao === 'none' || !data.valor || data.valor <= 0) {
     await ctx.reply('Nexus: Não consegui identificar a conta. Tente: "adicionar conta Luz R$150 vence dia 10/04"');
@@ -408,12 +402,7 @@ const handleCriarContaPagar = async (ctx: BotCtx, data: NexusResponse) => {
   }
 
   if (!data.vencimento || data.vencimento === 'none') {
-    pendingBillCreations.set(chatId, {
-      descricao: data.descricao,
-      valor: data.valor,
-      entity: data.contexto,
-    });
-    await ctx.reply(`Entendido — conta *${data.descricao}* de ${fmtBRL(data.valor)}.\n\nQual é a data de vencimento? (ex: 05/04/2026 ou 2026-04-05)`);
+    await ctx.reply(`Entendido. Para salvar essa conta eu ainda preciso da data de vencimento.\n\nEnvie tudo em uma unica mensagem, por exemplo: "adicionar conta ${data.descricao} ${fmtBRL(data.valor)} vence dia 10/04".`);
     return;
   }
 
@@ -510,20 +499,11 @@ const handleCriarLancamento = async (ctx: BotCtx, data: NexusResponse, originalT
     findBankFromText(originalText, data.contexto);
   console.log('[handleCriarLancamento] inferredBank:', inferredBank, 'needs_bank:', data.needs_bank);
 
-  if (!inferredBank || data.needs_bank) {
-    pendingTransactions.set(chatId, {
-      descricao: data.descricao, valor: data.valor,
-      tipo: data.tipo as TransactionType, contexto: data.contexto, categoria: data.categoria,
-    });
-    await ctx.reply(`${data.message}\n\n${getBankQuestion()}`);
-    return;
-  }
-
   console.log('[handleCriarLancamento] inserting to supabase...');
   const { error } = await saveTransaction({
     descricao: data.descricao, valor: data.valor,
     tipo: data.tipo as TransactionType, contexto: data.contexto,
-    categoria: data.categoria, bank_account: inferredBank,
+    categoria: data.categoria, bank_account: inferredBank ?? null,
   });
 
   if (error) {
@@ -533,6 +513,11 @@ const handleCriarLancamento = async (ctx: BotCtx, data: NexusResponse, originalT
   }
 
   console.log('[handleCriarLancamento] saved!');
+  if (!inferredBank || data.needs_bank) {
+    await ctx.reply(`Nexus: ${data.message}\n\nSalvei esse lançamento sem vincular um banco. Se quiser, eu posso registrar o próximo já com "Bradesco PF", "Bradesco PJ", "C6 PF", "C6 PJ" ou "Santander PF" na mensagem.`);
+    return;
+  }
+
   await ctx.reply(`Nexus: ${data.message}`);
 };
 
@@ -686,34 +671,7 @@ export const handleTelegramUpdate = async (body: Update) => {
     return;
   }
 
-  // ── Pending bill (aguardando data de vencimento) ────────────────────────────
-  const pendingBill = pendingBillCreations.get(chatId);
-  if (pendingBill) {
-    const normalized = text.trim().replace(/(\d{2})\/(\d{2})\/(\d{4})/, '$3-$2-$1');
-    const isoDate = /^\d{4}-\d{2}-\d{2}$/.test(normalized)
-      ? normalized
-      : (() => {
-          const match = text.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{4}))?/);
-          if (match) {
-            const year = match[3] ?? new Date().getFullYear().toString();
-            return `${year}-${String(match[2]).padStart(2, '0')}-${String(match[1]).padStart(2, '0')}`;
-          }
-          return null;
-        })();
-
-    if (!isoDate) {
-      await ctx.reply('Data inválida. Use o formato DD/MM/AAAA (ex: 10/04/2026).');
-      return;
-    }
-    const { error } = await saveBill({ ...pendingBill, due_date: isoDate });
-    if (error) { await ctx.reply('Erro ao salvar a conta. Tente novamente.'); return; }
-    pendingBillCreations.delete(chatId);
-    const dueFormatted = new Date(isoDate + 'T12:00:00').toLocaleDateString('pt-BR');
-    await ctx.reply(`✅ Conta *${pendingBill.descricao}* de ${fmtBRL(pendingBill.valor)} registrada — vence em ${dueFormatted}.`, { parse_mode: 'Markdown' });
-    return;
-  }
-
-  // ── Classify + Dispatch ─────────────────────────────────────────────────────
+  // Classify + Dispatch
   try {
     console.log('[bot] classifying:', text);
     const raw = await generateJSON(groq, getClassifierPrompt(text));
