@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import Groq from 'groq-sdk';
 import { Context, Telegraf } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { Update } from 'telegraf/types';
@@ -68,15 +68,13 @@ interface AnalysisData {
     conta: string;
     contexto: string;
   }>;
-  porCategoria: Record<string, number>;
   porConta: Record<string, { entradas: number; saidas: number; saldo: number }>;
   porContexto: Record<string, { entradas: number; saidas: number; saldo: number }>;
 }
 
 interface TelegramRuntime {
   bot: Telegraf;
-  classifierModel: ReturnType<GoogleGenerativeAI['getGenerativeModel']>;
-  analysisModel: ReturnType<GoogleGenerativeAI['getGenerativeModel']>;
+  groq: Groq;
 }
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -84,6 +82,32 @@ interface TelegramRuntime {
 const pendingTransactions = new Map<number, PendingTransaction>();
 const supportedBankList = BANK_ACCOUNTS.map((a) => `${a.id} (${a.label})`).join(', ');
 let runtime: TelegramRuntime | null = null;
+
+// ─── Groq Helpers ─────────────────────────────────────────────────────────────
+
+const CLASSIFIER_MODEL = 'llama3-8b-8192';   // 14.400 RPD free — JSON mode
+const ANALYSIS_MODEL   = 'llama-3.3-70b-versatile'; // melhor raciocínio — texto livre
+
+const generateJSON = async (groq: Groq, prompt: string): Promise<string> => {
+  const completion = await groq.chat.completions.create({
+    model: CLASSIFIER_MODEL,
+    messages: [{ role: 'user', content: prompt }],
+    response_format: { type: 'json_object' },
+    temperature: 0.1,
+    max_tokens: 1024,
+  });
+  return completion.choices[0]?.message?.content ?? '';
+};
+
+const generateText = async (groq: Groq, prompt: string): Promise<string> => {
+  const completion = await groq.chat.completions.create({
+    model: ANALYSIS_MODEL,
+    messages: [{ role: 'user', content: prompt }],
+    temperature: 0.7,
+    max_tokens: 1024,
+  });
+  return completion.choices[0]?.message?.content ?? '';
+};
 
 // ─── Prompts ──────────────────────────────────────────────────────────────────
 
@@ -104,12 +128,12 @@ MAPEAMENTO DE INTENÇÃO → AÇÃO:
 - "lança", "adiciona", "registra", "gastei", "paguei", "recebi", "entrou", "saiu" → criar_lancamento
 - "remove", "apaga", "exclui", "cancela" → remover_lancamento
 - "corrige", "edita", "altera", "muda" → editar_lancamento
-- "lista", "mostra", "quero ver", "me mostra", "me lista" → listar_lancamentos
+- "lista", "mostra", "quero ver", "me mostra" → listar_lancamentos
 - "busca", "encontra", "procura" → buscar_lancamento
-- "como foi esse mês", "resumo do período", "resumo do mês", "esse mês" → resumo_periodo
+- "como foi esse mês", "resumo do período", "resumo do mês" → resumo_periodo
 - "onde gasto mais", "por categoria", "categorias" → resumo_por_categoria
 - "por banco", "por conta", "contas" → resumo_por_conta
-- "como estou financeiramente", "saúde financeira", "situação", "estou bem?" → analisar_saude_financeira
+- "como estou financeiramente", "saúde financeira", "situação" → analisar_saude_financeira
 - "comparar", "mês anterior", "comparação" → comparar_periodos
 - "o que ajustar", "onde economizar", "cortar gastos" → sugerir_ajustes
 - "posso investir", "onde investir", "investimento" → sugerir_investimentos
@@ -120,197 +144,122 @@ REGRAS PARA LANÇAMENTOS:
 - Santander existe apenas como santander_pf
 - Assuma CPF por padrão, salvo menção a empresa, negócio, PJ ou CNPJ
 - Se o banco não estiver claro, retorne needs_bank: true e conta: "none"
-- Se houver lançamento positivo → tipo: "income"
-- Se houver lançamento de gasto/pagamento → tipo: "expense"
+- Lançamento positivo / receita → tipo: "income"
+- Gasto / pagamento → tipo: "expense"
 
-REGRAS GERAIS:
-- Nunca misture PF e PJ sem avisar
-- Nunca invente regra fiscal ou valor
-- Se faltar informação essencial, peça apenas o necessário no campo "message"
-- Quando houver risco financeiro, avise no campo "message"
-
-RETORNE APENAS JSON VÁLIDO (sem markdown, sem código):
+RETORNE APENAS JSON VÁLIDO:
 {
-  "acao": "criar_lancamento | editar_lancamento | remover_lancamento | listar_lancamentos | buscar_lancamento | resumo_periodo | resumo_por_categoria | resumo_por_conta | analisar_saude_financeira | comparar_periodos | sugerir_ajustes | sugerir_investimentos | conversa",
-  "tipo": "income | expense | none",
+  "acao": "criar_lancamento",
+  "tipo": "income",
   "valor": 0,
-  "descricao": "descrição curta ou none",
-  "data": "YYYY-MM-DD ou hoje",
-  "categoria": "nome da categoria ou none",
-  "conta": "bradesco_pf | bradesco_pj | c6_pf | c6_pj | santander_pf | none",
-  "contexto": "CPF | CNPJ",
+  "descricao": "descricao curta",
+  "data": "hoje",
+  "categoria": "categoria",
+  "conta": "none",
+  "contexto": "CPF",
   "needs_bank": false,
-  "periodo": "mes_atual | semana | YYYY-MM | none",
-  "termo": "termo de busca ou none",
-  "message": "sua resposta direta ao usuário em português"
+  "periodo": "none",
+  "termo": "none",
+  "message": "resposta ao usuario em portugues"
 }
 `;
 
 const getAnalysisPrompt = (userMessage: string, acao: AcaoType, data: AnalysisData) => `
-Você é o Nexus Wealth, Assistente Financeiro completo com comportamento humano.
+Você é o Nexus Wealth, Assistente Financeiro com comportamento humano.
 Tom: direto, inteligente, confiável, sem enrolação. Você não é robô.
 
 O usuário pediu: "${userMessage}"
 Ação: ${acao}
 
 DADOS FINANCEIROS (período: ${data.periodo}):
-- Total de entradas: R$ ${data.totalEntradas.toFixed(2)}
-- Total de saídas: R$ ${data.totalSaidas.toFixed(2)}
+- Entradas: R$ ${data.totalEntradas.toFixed(2)}
+- Saídas: R$ ${data.totalSaidas.toFixed(2)}
 - Saldo: R$ ${data.saldo.toFixed(2)}
-- Transações recentes: ${JSON.stringify(data.transacoes.slice(0, 15), null, 2)}
-- Por conta: ${JSON.stringify(data.porConta, null, 2)}
-- Por contexto (CPF/CNPJ): ${JSON.stringify(data.porContexto, null, 2)}
+- Por conta: ${JSON.stringify(data.porConta)}
+- Por contexto (CPF/CNPJ): ${JSON.stringify(data.porContexto)}
+- Últimas transações: ${JSON.stringify(data.transacoes.slice(0, 12))}
 
-INSTRUÇÕES POR AÇÃO:
+INSTRUÇÕES:
+- analisar_saude_financeira: classifique (Excelente/Saudável/Atenção/Em risco/Crítico), explique, liste problemas, dê 2-3 ações práticas
+- resumo_*: mostre números principais, identifique padrão, dê insight prático
+- sugerir_ajustes: baseie-se nos dados reais, aponte excessos específicos
+- sugerir_investimentos: só sugira se o saldo permitir, sem inventar retornos
+- listar_lancamentos / buscar_lancamento: apresente dados claros e organizados
 
-analisar_saude_financeira:
-→ Classifique a saúde: Excelente / Saudável / Atenção / Em risco / Crítica
-→ Explique por que chegou a essa classificação
-→ Liste os principais problemas encontrados
-→ Dê 2-3 ações práticas e imediatas
-→ Alerte se: gastos excessivos em categoria, risco de caixa, despesas fixas altas, dependência de única renda, mistura PF/PJ
-
-resumo_periodo / resumo_por_categoria / resumo_por_conta:
-→ Mostre os números principais com clareza
-→ Identifique a categoria ou conta com maior gasto
-→ Aponte padrão de consumo relevante
-→ Dê um insight prático
-
-sugerir_ajustes:
-→ Baseie-se nos dados reais, não em genericidades
-→ Aponte categorias ou contas onde há excessos
-→ Sugira cortes específicos e viáveis
-
-sugerir_investimentos:
-→ Só sugira se o saldo permitir
-→ Seja específico ao perfil dos dados
-→ Nunca invente retornos ou garantias
-
-listar_lancamentos / buscar_lancamento:
-→ Apresente os dados de forma clara e organizada
-→ Destaque valores relevantes
-→ Indique o total encontrado
-
-Responda em português, de forma direta, humana e útil.
-Não use linguagem genérica. Não invente dados que não estão acima.
+Responda em português, de forma direta e útil. Sem genericidades.
 `;
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 const normalizeText = (value: string) =>
-  value
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase();
+  value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 
 const findBankFromText = (text: string, entity?: EntityType): BankAccountId | null => {
   const normalized = normalizeText(text);
 
   for (const account of BANK_ACCOUNTS) {
-    const matchedAlias = account.aliases.some((alias) => normalized.includes(alias));
-    if (!matchedAlias) continue;
+    if (!account.aliases.some((alias) => normalized.includes(alias))) continue;
 
-    if (
-      normalized.includes('pf') ||
-      normalized.includes('pessoa fisica') ||
-      normalized.includes('pessoal')
-    ) {
+    if (normalized.includes('pf') || normalized.includes('pessoa fisica') || normalized.includes('pessoal')) {
       if (account.entity === 'CPF') return account.id;
       continue;
     }
-
-    if (
-      normalized.includes('pj') ||
-      normalized.includes('pessoa juridica') ||
-      normalized.includes('empresa')
-    ) {
+    if (normalized.includes('pj') || normalized.includes('pessoa juridica') || normalized.includes('empresa')) {
       if (account.entity === 'CNPJ') return account.id;
       continue;
     }
-
     if (account.bank === 'Santander') return 'santander_pf';
-
     if (entity) {
-      const inferred = BANK_ACCOUNTS.find(
-        (option) => option.bank === account.bank && option.entity === entity,
-      );
+      const inferred = BANK_ACCOUNTS.find((o) => o.bank === account.bank && o.entity === entity);
       if (inferred) return inferred.id;
     }
-
     return account.id;
   }
-
   return null;
 };
 
 const getBankQuestion = () =>
-  [
-    'De qual banco foi essa transação? Responda com uma destas opções:',
-    'Bradesco PF',
-    'Bradesco PJ',
-    'C6 PF',
-    'C6 PJ',
-    'Santander PF',
-  ].join('\n');
+  ['De qual banco foi essa transação? Responda com uma destas opções:', 'Bradesco PF', 'Bradesco PJ', 'C6 PF', 'C6 PJ', 'Santander PF'].join('\n');
 
-const getGeminiUserMessage = (error: unknown) => {
+const getErrorMessage = (error: unknown) => {
   const raw = error instanceof Error ? error.message : String(error);
-  const message = raw.toLowerCase();
+  const msg = raw.toLowerCase();
 
-  console.error('[Nexus] Gemini raw error:', raw);
+  console.error('[Nexus] Groq error:', raw);
 
-  if (message.includes('api key') || message.includes('api_key')) {
-    return 'Chave do Gemini inválida ou ausente. Verifique GEMINI_API_KEY nas variáveis de ambiente do deploy.';
+  if (msg.includes('api key') || msg.includes('authentication') || msg.includes('401') || msg.includes('invalid_api_key')) {
+    return 'Chave do Groq inválida ou ausente. Verifique GROQ_API_KEY nas variáveis de ambiente do deploy.';
   }
-
-  if (
-    message.includes('quota') ||
-    message.includes('rate limit') ||
-    message.includes('resource has been exhausted') ||
-    message.includes('429')
-  ) {
-    return `Cota do Gemini esgotada. Aguarde e tente novamente.\n\n_Detalhe: ${raw.slice(0, 220)}_`;
+  if (msg.includes('rate limit') || msg.includes('429') || msg.includes('too many')) {
+    return `Groq: limite de requisições atingido. Tente novamente em instantes.\n\n_${raw.slice(0, 200)}_`;
   }
-
-  if (message.includes('not found') || message.includes('404')) {
-    return `Modelo de IA não encontrado. Verifique o nome do modelo na configuração.\n\n_Detalhe: ${raw.slice(0, 220)}_`;
+  if (msg.includes('not found') || msg.includes('404')) {
+    return `Modelo não encontrado.\n\n_${raw.slice(0, 200)}_`;
   }
-
-  if (message.includes('fetch failed') || message.includes('econnrefused') || message.includes('etimedout')) {
-    return 'Não consegui alcançar a API do Gemini. Verifique a conexão do servidor.';
+  if (msg.includes('fetch failed') || msg.includes('econnrefused') || msg.includes('etimedout')) {
+    return 'Não consegui alcançar a API do Groq. Verifique a conexão do servidor.';
   }
-
-  return `Erro Gemini: ${raw.slice(0, 200)}`;
+  return `Erro: ${raw.slice(0, 200)}`;
 };
 
 // ─── Supabase ─────────────────────────────────────────────────────────────────
 
-const saveTransaction = async (
-  transaction: PendingTransaction & { bank_account: BankAccountId },
-) => {
+const saveTransaction = async (transaction: PendingTransaction & { bank_account: BankAccountId }) => {
   const account = BANK_ACCOUNT_BY_ID[transaction.bank_account];
-
-  return supabase.from('transactions').insert([
-    {
-      description: transaction.descricao,
-      amount: transaction.valor,
-      type: transaction.tipo,
-      entity: account.entity,
-      bank_account: transaction.bank_account,
-    },
-  ]);
+  return supabase.from('transactions').insert([{
+    description: transaction.descricao,
+    amount: transaction.valor,
+    type: transaction.tipo,
+    entity: account.entity,
+    bank_account: transaction.bank_account,
+  }]);
 };
 
 const fetchAnalysisData = async (periodo?: string): Promise<AnalysisData> => {
   const empty: AnalysisData = {
     periodo: periodo || 'mes_atual',
-    totalEntradas: 0,
-    totalSaidas: 0,
-    saldo: 0,
-    transacoes: [],
-    porCategoria: {},
-    porConta: {},
-    porContexto: {},
+    totalEntradas: 0, totalSaidas: 0, saldo: 0,
+    transacoes: [], porConta: {}, porContexto: {},
   };
 
   let query = supabase
@@ -320,83 +269,53 @@ const fetchAnalysisData = async (periodo?: string): Promise<AnalysisData> => {
     .limit(200);
 
   const now = new Date();
-
   if (!periodo || periodo === 'mes_atual' || periodo === 'none') {
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-    query = query.gte('created_at', startOfMonth);
+    query = query.gte('created_at', new Date(now.getFullYear(), now.getMonth(), 1).toISOString());
   } else if (periodo === 'semana') {
-    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
-    query = query.gte('created_at', sevenDaysAgo);
+    query = query.gte('created_at', new Date(now.getTime() - 7 * 86400000).toISOString());
   } else if (/^\d{4}-\d{2}$/.test(periodo)) {
-    const [year, month] = periodo.split('-').map(Number);
-    const start = new Date(year, month - 1, 1).toISOString();
-    const end = new Date(year, month, 1).toISOString();
-    query = query.gte('created_at', start).lt('created_at', end);
+    const [y, m] = periodo.split('-').map(Number);
+    query = query.gte('created_at', new Date(y, m - 1, 1).toISOString()).lt('created_at', new Date(y, m, 1).toISOString());
   }
 
   const { data, error } = await query;
-
   if (error || !data) return empty;
 
-  let totalEntradas = 0;
-  let totalSaidas = 0;
+  let totalEntradas = 0, totalSaidas = 0;
   const porConta: AnalysisData['porConta'] = {};
   const porContexto: AnalysisData['porContexto'] = {};
 
   for (const t of data as TransactionRow[]) {
     const isIncome = t.type === 'income';
     const value = t.amount || 0;
-
-    if (isIncome) totalEntradas += value;
-    else totalSaidas += value;
+    if (isIncome) totalEntradas += value; else totalSaidas += value;
 
     const conta = t.bank_account || 'sem_conta';
     if (!porConta[conta]) porConta[conta] = { entradas: 0, saidas: 0, saldo: 0 };
-    if (isIncome) {
-      porConta[conta].entradas += value;
-      porConta[conta].saldo += value;
-    } else {
-      porConta[conta].saidas += value;
-      porConta[conta].saldo -= value;
-    }
+    if (isIncome) { porConta[conta].entradas += value; porConta[conta].saldo += value; }
+    else { porConta[conta].saidas += value; porConta[conta].saldo -= value; }
 
     const ctx = t.entity || 'CPF';
     if (!porContexto[ctx]) porContexto[ctx] = { entradas: 0, saidas: 0, saldo: 0 };
-    if (isIncome) {
-      porContexto[ctx].entradas += value;
-      porContexto[ctx].saldo += value;
-    } else {
-      porContexto[ctx].saidas += value;
-      porContexto[ctx].saldo -= value;
-    }
+    if (isIncome) { porContexto[ctx].entradas += value; porContexto[ctx].saldo += value; }
+    else { porContexto[ctx].saidas += value; porContexto[ctx].saldo -= value; }
   }
 
   return {
     periodo: periodo || 'mes_atual',
-    totalEntradas,
-    totalSaidas,
+    totalEntradas, totalSaidas,
     saldo: totalEntradas - totalSaidas,
     transacoes: (data as TransactionRow[]).slice(0, 20).map((t) => ({
-      descricao: t.description,
-      valor: t.amount,
-      tipo: t.type,
-      data: t.created_at,
-      conta: t.bank_account || 'sem_conta',
-      contexto: t.entity || 'CPF',
+      descricao: t.description, valor: t.amount, tipo: t.type,
+      data: t.created_at, conta: t.bank_account || 'sem_conta', contexto: t.entity || 'CPF',
     })),
-    porCategoria: {},
-    porConta,
-    porContexto,
+    porConta, porContexto,
   };
 };
 
 // ─── Action Handlers ──────────────────────────────────────────────────────────
 
-const handleCriarLancamento = async (
-  ctx: Context,
-  data: NexusResponse,
-  originalText: string,
-) => {
+const handleCriarLancamento = async (ctx: Context, data: NexusResponse, originalText: string) => {
   const chatId = ctx.chat!.id;
 
   if (data.tipo === 'none' || !data.valor || data.valor <= 0) {
@@ -410,23 +329,17 @@ const handleCriarLancamento = async (
 
   if (!inferredBank || data.needs_bank) {
     pendingTransactions.set(chatId, {
-      descricao: data.descricao,
-      valor: data.valor,
-      tipo: data.tipo as TransactionType,
-      contexto: data.contexto,
-      categoria: data.categoria,
+      descricao: data.descricao, valor: data.valor,
+      tipo: data.tipo as TransactionType, contexto: data.contexto, categoria: data.categoria,
     });
     await ctx.reply(`${data.message}\n\n${getBankQuestion()}`);
     return;
   }
 
   const { error } = await saveTransaction({
-    descricao: data.descricao,
-    valor: data.valor,
-    tipo: data.tipo as TransactionType,
-    contexto: data.contexto,
-    categoria: data.categoria,
-    bank_account: inferredBank,
+    descricao: data.descricao, valor: data.valor,
+    tipo: data.tipo as TransactionType, contexto: data.contexto,
+    categoria: data.categoria, bank_account: inferredBank,
   });
 
   if (error) {
@@ -438,78 +351,40 @@ const handleCriarLancamento = async (
   await ctx.reply(`Nexus: ${data.message}`);
 };
 
-const handleAnalise = async (
-  ctx: Context,
-  userMessage: string,
-  acao: AcaoType,
-  periodo: string | undefined,
-  analysisModel: TelegramRuntime['analysisModel'],
-) => {
+const handleAnalise = async (ctx: Context, userMessage: string, acao: AcaoType, periodo: string | undefined, groq: Groq) => {
   await ctx.reply('Analisando seus dados...');
-
   const analysisData = await fetchAnalysisData(periodo);
-  const prompt = getAnalysisPrompt(userMessage, acao, analysisData);
-
   try {
-    const result = await analysisModel.generateContent(prompt);
-    await ctx.reply(result.response.text());
+    const response = await generateText(groq, getAnalysisPrompt(userMessage, acao, analysisData));
+    await ctx.reply(response);
   } catch (err) {
-    console.error('Analysis Error:', err);
     const { totalEntradas, totalSaidas, saldo } = analysisData;
-    await ctx.reply(
-      `Resumo financeiro (${analysisData.periodo}):\n\nEntradas: R$ ${totalEntradas.toFixed(2)}\nSaídas: R$ ${totalSaidas.toFixed(2)}\nSaldo: R$ ${saldo.toFixed(2)}`,
-    );
+    await ctx.reply(`Resumo (${analysisData.periodo}):\n\nEntradas: R$ ${totalEntradas.toFixed(2)}\nSaídas: R$ ${totalSaidas.toFixed(2)}\nSaldo: R$ ${saldo.toFixed(2)}`);
   }
 };
 
-const handleListagem = async (
-  ctx: Context,
-  userMessage: string,
-  acao: AcaoType,
-  periodo: string | undefined,
-  termo: string | undefined,
-  analysisModel: TelegramRuntime['analysisModel'],
-) => {
+const handleListagem = async (ctx: Context, userMessage: string, acao: AcaoType, periodo: string | undefined, termo: string | undefined, groq: Groq) => {
   await ctx.reply('Buscando lançamentos...');
-
   const analysisData = await fetchAnalysisData(periodo);
 
   if (termo && termo !== 'none' && acao === 'buscar_lancamento') {
-    const normalizedTermo = termo.toLowerCase();
-    analysisData.transacoes = analysisData.transacoes.filter((t) =>
-      t.descricao?.toLowerCase().includes(normalizedTermo),
-    );
+    const t = termo.toLowerCase();
+    analysisData.transacoes = analysisData.transacoes.filter((tx) => tx.descricao?.toLowerCase().includes(t));
   }
 
-  const prompt = getAnalysisPrompt(userMessage, acao, analysisData);
-
   try {
-    const result = await analysisModel.generateContent(prompt);
-    await ctx.reply(result.response.text());
-  } catch (err) {
-    console.error('Listing Error:', err);
-    const transacoes = analysisData.transacoes.slice(0, 10);
-    if (!transacoes.length) {
-      await ctx.reply('Nenhum lançamento encontrado para o período.');
-      return;
-    }
-    const lista = transacoes
-      .map(
-        (t) =>
-          `• ${t.descricao}: R$ ${t.valor?.toFixed(2)} (${t.tipo === 'income' ? 'entrada' : 'saída'}) — ${t.conta}`,
-      )
-      .join('\n');
-    await ctx.reply(`Lançamentos encontrados:\n\n${lista}`);
+    const response = await generateText(groq, getAnalysisPrompt(userMessage, acao, analysisData));
+    await ctx.reply(response);
+  } catch {
+    const txs = analysisData.transacoes.slice(0, 10);
+    if (!txs.length) { await ctx.reply('Nenhum lançamento encontrado.'); return; }
+    await ctx.reply(`Lançamentos:\n\n${txs.map((t) => `• ${t.descricao}: R$ ${t.valor?.toFixed(2)} (${t.tipo === 'income' ? 'entrada' : 'saída'})`).join('\n')}`);
   }
 };
 
 // ─── Bot Registration ─────────────────────────────────────────────────────────
 
-const registerHandlers = (
-  bot: Telegraf,
-  classifierModel: TelegramRuntime['classifierModel'],
-  analysisModel: TelegramRuntime['analysisModel'],
-) => {
+const registerHandlers = (bot: Telegraf, groq: Groq) => {
   bot.on(message('text'), async (ctx) => {
     const text = ctx.message.text.trim();
     const chatId = ctx.chat.id;
@@ -517,37 +392,30 @@ const registerHandlers = (
 
     if (pending) {
       const bankAccount = findBankFromText(text, pending.contexto);
-
       if (!bankAccount) {
         await ctx.reply(`Não consegui identificar o banco.\n\n${getBankQuestion()}`);
         return;
       }
-
       const { error } = await saveTransaction({ ...pending, bank_account: bankAccount });
-
       if (error) {
         console.error('Supabase Error:', error);
-        await ctx.reply('Erro ao salvar a transação. Verifique se a coluna bank_account existe na tabela transactions.');
+        await ctx.reply('Erro ao salvar a transação.');
         return;
       }
-
       pendingTransactions.delete(chatId);
       await ctx.reply(`Lançamento salvo no ${BANK_ACCOUNT_BY_ID[bankAccount].label}.`);
       return;
     }
 
-    const prompt = getClassifierPrompt(text);
-
     try {
-      const result = await classifierModel.generateContent(prompt);
-      const responseText = result.response.text();
-      const cleanedText = responseText.replace(/```json/gi, '').replace(/```/g, '').trim();
+      const raw = await generateJSON(groq, getClassifierPrompt(text));
+      const cleaned = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
 
       let data: NexusResponse;
       try {
-        data = JSON.parse(cleanedText) as NexusResponse;
+        data = JSON.parse(cleaned) as NexusResponse;
       } catch (parseError) {
-        console.error('JSON Parse Error:', parseError, 'Raw:', cleanedText);
+        console.error('JSON Parse Error:', parseError, 'Raw:', cleaned);
         await ctx.reply('Não consegui processar sua solicitação. Tente novamente.');
         return;
       }
@@ -564,27 +432,25 @@ const registerHandlers = (
         case 'sugerir_ajustes':
         case 'sugerir_investimentos':
         case 'comparar_periodos':
-          await handleAnalise(ctx, text, data.acao, data.periodo, analysisModel);
+          await handleAnalise(ctx, text, data.acao, data.periodo, groq);
           break;
 
         case 'listar_lancamentos':
         case 'buscar_lancamento':
-          await handleListagem(ctx, text, data.acao, data.periodo, data.termo, analysisModel);
+          await handleListagem(ctx, text, data.acao, data.periodo, data.termo, groq);
           break;
 
         case 'editar_lancamento':
         case 'remover_lancamento':
-          await ctx.reply(
-            `Nexus: ${data.message}\n\n⚠️ Edição e remoção ainda estão em desenvolvimento. Por enquanto, use o dashboard para gerenciar esses lançamentos.`,
-          );
+          await ctx.reply(`Nexus: ${data.message}\n\n⚠️ Edição e remoção ainda estão em desenvolvimento. Use o dashboard para gerenciar esses lançamentos.`);
           break;
 
         default:
           await ctx.reply(`Nexus: ${data.message}`);
       }
     } catch (err) {
-      console.error('Gemini API Error:', { error: err, text, chatId });
-      await ctx.reply(getGeminiUserMessage(err));
+      console.error('Groq API Error:', { error: err, text, chatId });
+      await ctx.reply(getErrorMessage(err));
     }
   });
 };
@@ -595,30 +461,16 @@ const getTelegramRuntime = (): TelegramRuntime => {
   if (runtime) return runtime;
 
   const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
-  const geminiApiKey = process.env.GEMINI_API_KEY;
+  const groqApiKey = process.env.GROQ_API_KEY;
 
-  if (!telegramBotToken) {
-    throw new Error('TELEGRAM_BOT_TOKEN is not defined in environment variables.');
-  }
-
-  if (!geminiApiKey) {
-    throw new Error('GEMINI_API_KEY is not defined in environment variables.');
-  }
+  if (!telegramBotToken) throw new Error('TELEGRAM_BOT_TOKEN is not defined.');
+  if (!groqApiKey) throw new Error('GROQ_API_KEY is not defined.');
 
   const bot = new Telegraf(telegramBotToken);
-  const genAI = new GoogleGenerativeAI(geminiApiKey);
+  const groq = new Groq({ apiKey: groqApiKey });
 
-  const classifierModel = genAI.getGenerativeModel({
-    model: 'gemini-2.0-flash-exp',
-    generationConfig: { responseMimeType: 'application/json' },
-  });
-
-  const analysisModel = genAI.getGenerativeModel({
-    model: 'gemini-2.0-flash-exp',
-  });
-
-  registerHandlers(bot, classifierModel, analysisModel);
-  runtime = { bot, classifierModel, analysisModel };
+  registerHandlers(bot, groq);
+  runtime = { bot, groq };
   return runtime;
 };
 
